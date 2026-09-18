@@ -1,0 +1,83 @@
+version: "1"
+
+# TypeSafe AI Jev System 1 Settings
+jev:
+  api_key: "${TYPESAFE_API_KEY}"
+  model: "jev-latest"
+  base_url: "https://api.typesafe.ai"
+  # Egress proxy for restricted/isolated networks (e.g. Russia, corporate VPNs)
+  egress_proxy: "${JEV_EGRESS_PROXY:-http://192.168.0.142:18080}"
+  timeout_seconds: 15
+
+# Daemon Loop Settings
+daemon:
+  interval_seconds: 60
+  concurrency: 8
+  log_level: "info"
+
+# Alerting Channels
+alerting:
+  telegram:
+    bot_token: "${TELEGRAM_BOT_TOKEN}"
+    chat_id: "${TELEGRAM_CHAT_ID}"
+    min_severity: "warning" # info, warning, critical
+
+# Bounded Self-Healing Settings
+self_healing:
+  enabled: false
+  allowed_services:
+    - "osaurus"
+    - "caddy"
+  require_confirmation: true
+
+# Monitored Targets
+targets:
+  # 1. macOS Host (Apple Silicon memory, swap, LaunchAgents)
+  - type: macos_ssh
+    name: "mac-mini-m4"
+    host: "100.116.97.112"
+    user: "slovn"
+    ssh_key: "~/.ssh/id_ed25519"
+    timeout_seconds: 5
+    check_services:
+      - "osaurus"
+      - "gemma-4-e4b"
+
+  # 2. Nvidia GPU Node (Temperature, VRAM, utilization)
+  - type: nvidia_ssh
+    name: "gpu-rtx5060ti"
+    host: "x3d-pve-1"
+    user: "root"
+    ssh_key: "~/.ssh/id_ed25519"
+    timeout_seconds: 5
+
+  # 3. HTTP Healthchecks
+  - type: http_probe
+    name: "hermes-dashboard"
+    url: "http://127.0.0.1:9119"
+    expected_status: 200
+    timeout_seconds: 3
+
+  - type: http_probe
+    name: "ai-gateway"
+    url: "http://192.168.0.220:8317/health"
+    expected_status: 200
+    timeout_seconds: 3
+
+  # 4. TCP Service Reachability
+  - type: tcp_ping
+    name: "caddy-ingress"
+    host: "192.168.0.210"
+    port: 443
+    timeout_seconds: 3
+
+  # 5. Generic Script / Command Probe (Extensible without Rust recompilation!)
+  - type: exec_probe
+    name: "proxmox-quorum"
+    command:
+      - "ssh"
+      - "-o"
+      - "BatchMode=yes"
+      - "root@192.168.0.169"
+      - "pvecm status | grep -q 'Quorum: Yes' && echo '{\"quorum\": true}'"
+    timeout_seconds: 5
