@@ -18,7 +18,7 @@ pub async fn collect_nvidia(
 
     let mut ssh_args = vec![
         "-o".to_string(), "BatchMode=yes".to_string(),
-        "-o".to_string(), "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(), "StrictHostKeyChecking=yes".to_string(),
         "-o".to_string(), format!("ConnectTimeout={}", timeout_seconds),
     ];
 
