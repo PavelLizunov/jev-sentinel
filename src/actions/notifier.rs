@@ -243,10 +243,13 @@ impl Notifier {
         // Coalesce into bounded pending table (max 64 entries)
         if let Some(existing) = state.pending.get_mut(&key) {
             if event.severity > existing.severity {
-                *existing = event; // Escalate severity!
-            } else {
+                *existing = event; // Escalate severity and message!
+            } else if event.severity == existing.severity {
                 existing.timestamp = event.timestamp;
                 existing.message = event.message;
+            } else {
+                // Lower severity arrives: keep peak severity, title and critical evidence!
+                existing.timestamp = event.timestamp;
             }
         } else {
             if state.pending.len() >= 64 {
@@ -278,18 +281,35 @@ impl Notifier {
 
     pub fn pop_next_pending(&self) -> Option<AlertEvent> {
         let mut state = self.delivery_state.lock().unwrap();
-        if state.pending.is_empty() {
-            return None;
+        while !state.pending.is_empty() {
+            let key_to_pop = state
+                .pending
+                .iter()
+                .max_by_key(|(_, e)| e.severity)
+                .map(|(k, _)| k.clone())?;
+
+            let event = state.pending.remove(&key_to_pop)?;
+
+            // Check if this pending event is already covered by a delivery cooldown
+            if let Some(inc) = state.incidents.get(&key_to_pop) {
+                if inc.current_generation == event.generation {
+                    if let Some((delivered_sev, sent_at)) = inc.delivered_cooldown {
+                        if event.severity <= delivered_sev
+                            && sent_at.elapsed() < Duration::from_secs(300)
+                        {
+                            debug!(
+                                "Discarding redundant pending repeat covered by cooldown: {:?}",
+                                key_to_pop
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            return Some(event);
         }
-
-        // Pick highest severity event (Critical -> Warning -> Info)
-        let key_to_pop = state
-            .pending
-            .iter()
-            .max_by_key(|(_, e)| e.severity)
-            .map(|(k, _)| k.clone())?;
-
-        state.pending.remove(&key_to_pop)
+        None
     }
 
     pub fn commit_delivery(&self, event: &AlertEvent) -> bool {
@@ -326,9 +346,7 @@ impl Notifier {
                 inc.delivered_cooldown = None;
             }
         }
-        state
-            .pending
-            .retain(|k, _| k.target_id.as_deref() != Some(target_id));
+        // Do not erase accepted undelivered pending events; they remain as historical alerts
     }
 
     pub fn recover_advisor_unavailable(&self) {
@@ -342,7 +360,7 @@ impl Notifier {
             inc.current_generation = inc.current_generation.wrapping_add(1);
             inc.delivered_cooldown = None;
         }
-        state.pending.remove(&adv_key);
+        // Do not erase pending
     }
 
     pub fn recover_risk_elevated(&self) {
@@ -356,7 +374,7 @@ impl Notifier {
             inc.current_generation = inc.current_generation.wrapping_add(1);
             inc.delivered_cooldown = None;
         }
-        state.pending.remove(&risk_key);
+        // Do not erase pending
     }
 
     pub async fn run_worker(
@@ -410,9 +428,22 @@ impl Notifier {
     }
 
     pub async fn dispatch_alert_event(&self, event: &AlertEvent) -> Result<bool> {
-        if !self.enqueue_alert(event.clone()) {
+        let Some(tg) = &self.telegram else {
+            return Ok(false);
+        };
+
+        let min_sev = tg.min_severity.to_lowercase();
+        let should_alert = match min_sev.as_str() {
+            "info" => true,
+            "warning" => event.severity >= AlertSeverity::Warning,
+            "critical" => event.severity >= AlertSeverity::Critical,
+            _ => event.severity >= AlertSeverity::Warning,
+        };
+
+        if !should_alert {
             return Ok(false);
         }
+
         let formatted = self.format_alert_event(event);
         self.send_raw_message(&formatted).await?;
         Ok(self.commit_delivery(event))
@@ -581,6 +612,8 @@ impl Notifier {
 
         for attempt in 0..3 {
             let mut send_err = None;
+            let mut retry_after_duration = None;
+
             while confirmed_chunks < chunks.len() {
                 let chunk = &chunks[confirmed_chunks];
                 let body = json!({
@@ -603,6 +636,24 @@ impl Notifier {
                 };
 
                 let status = resp.status();
+                if status.as_u16() == 429 {
+                    let err_text = resp.text().await.unwrap_or_default();
+                    if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&err_text) {
+                        if let Some(sec) = err_json
+                            .get("parameters")
+                            .and_then(|p| p.get("retry_after"))
+                            .and_then(|v| v.as_u64())
+                        {
+                            retry_after_duration = Some(Duration::from_secs(sec));
+                        }
+                    }
+                    send_err = Some(SentinelError::Action(format!(
+                        "Telegram API HTTP 429: {}",
+                        err_text
+                    )));
+                    break;
+                }
+
                 let check_res = if status.as_u16() == 400 {
                     let fallback_body = json!({
                         "chat_id": tg.chat_id,
@@ -638,7 +689,8 @@ impl Notifier {
 
             last_err = send_err;
             if attempt < 2 {
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                let sleep_duration = retry_after_duration.unwrap_or(Duration::from_millis(250));
+                tokio::time::sleep(sleep_duration).await;
             }
         }
 

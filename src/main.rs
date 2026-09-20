@@ -400,7 +400,7 @@ async fn run_daemon(
     // Background alert worker: processes queued alerts with bounded table, retries and generation guards
     let notifier_worker = Arc::clone(&notifier);
     let worker_shutdown_rx = shutdown_rx.clone();
-    tokio::spawn(async move {
+    let worker_handle = tokio::spawn(async move {
         notifier_worker.run_worker(worker_shutdown_rx).await;
     });
 
@@ -426,6 +426,7 @@ async fn run_daemon(
             _ = tokio::signal::ctrl_c() => {
                 info!("Shutdown signal received, terminating daemon gracefully...");
                 let _ = shutdown_tx.send(true);
+                let _ = tokio::time::timeout(Duration::from_secs(3), worker_handle).await;
                 break Ok(());
             }
             _ = interval.tick() => {
