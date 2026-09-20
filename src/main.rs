@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use colored::*;
 use jev_sentinel::actions::{
-    AlertEvent, AlertReason, AlertSeverity, AlertSource, Notifier, SelfHealingManager,
+    AlertReason, AlertSeverity, AlertSource, Notifier, SelfHealingManager,
 };
 use jev_sentinel::collectors::collect_all;
 use jev_sentinel::config::SentinelConfig;
@@ -391,22 +391,18 @@ async fn run_daemon(
     ));
     let self_healing = SelfHealingManager::new(config.self_healing.clone());
 
-    // Bounded background alert queue: decouples Telegram delivery from daemon polling cycles
-    let (alert_tx, mut alert_rx) = tokio::sync::mpsc::channel::<AlertEvent>(128);
-    let notifier_worker = Arc::clone(&notifier);
-    tokio::spawn(async move {
-        while let Some(event) = alert_rx.recv().await {
-            if let Err(e) = notifier_worker.dispatch_alert_event(&event).await {
-                error!("Background alert dispatch error: {}", e);
-            }
-        }
-    });
-
     // Optional web dashboard state channels
     let mut dashboard_history =
         jev_sentinel::web::models::DashboardHistory::new(config.daemon.interval_seconds);
     let (status_tx, status_rx) = tokio::sync::watch::channel(Arc::new(dashboard_history.initial()));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Background alert worker: processes queued alerts with bounded table, retries and generation guards
+    let notifier_worker = Arc::clone(&notifier);
+    let worker_shutdown_rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        notifier_worker.run_worker(worker_shutdown_rx).await;
+    });
 
     if config.web.enabled {
         let listen_addr = config.web.listen.clone();
@@ -519,21 +515,18 @@ async fn run_daemon(
                             ),
                             TargetStatus::Online => unreachable!(),
                         };
-                        let event = AlertEvent {
-                            source: AlertSource::LocalRule,
-                            target_id: Some(target.target_name.clone()),
-                            severity: sev,
-                            reason_code: reason,
-                            title: title.to_string(),
-                            message: msg,
-                            timestamp: chrono::Utc::now(),
-                        };
-                        if let Err(e) = alert_tx.try_send(event) {
-                            error!("Alert queue full or closed, dropping event for '{}': {}", target.target_name, e);
-                        }
+                        let event = notifier.build_alert_event(
+                            AlertSource::LocalRule,
+                            Some(target.target_name.clone()),
+                            sev,
+                            reason,
+                            title,
+                            msg,
+                        );
+                        notifier.enqueue_alert(event);
                     } else {
                         // Clear cooldown on recovery so future issues immediately alert
-                        notifier.clear_alert_cooldown(&target.target_name);
+                        notifier.recover_target(&target.target_name);
                     }
                 }
 
@@ -557,8 +550,12 @@ async fn run_daemon(
                             });
                         }
 
-                        // Reset advisor cooldown upon successful recovery
-                        notifier.clear_advisor_cooldown();
+                        // Reset advisor unavailable upon successful recovery
+                        notifier.recover_advisor_unavailable();
+                        // Reset risk elevated cooldown ONLY when risk has actually normalized!
+                        if !decision.is_warning() && !decision.is_critical() {
+                            notifier.recover_risk_elevated();
+                        }
 
                         // Route routine Jev alert through background queue with deduplication
                         let is_info = config
@@ -572,30 +569,27 @@ async fn run_daemon(
                                 Some(c) => format!(". Уверенность: {:.0}%", c * 100.0),
                                 None => String::new(),
                             };
-                            let event = AlertEvent {
-                                source: AlertSource::JevAdvisor,
-                                target_id: None,
-                                severity: if decision.is_critical() {
+                            let event = notifier.build_alert_event(
+                                AlertSource::JevAdvisor,
+                                None,
+                                if decision.is_critical() {
                                     AlertSeverity::Critical
                                 } else if decision.is_warning() {
                                     AlertSeverity::Warning
                                 } else {
                                     AlertSeverity::Info
                                 },
-                                reason_code: AlertReason::RiskElevated,
-                                title: format!(
+                                AlertReason::RiskElevated,
+                                format!(
                                     "Jev System 1: {}",
                                     decision.system_health.to_uppercase()
                                 ),
-                                message: format!(
+                                format!(
                                     "Оценка риска: {:.2} / 1.00. Рекомендация: {}{}",
                                     decision.risk_score, decision.suggested_action, conf_text
                                 ),
-                                timestamp: chrono::Utc::now(),
-                            };
-                            if let Err(e) = alert_tx.try_send(event) {
-                                error!("Alert queue full or closed for Jev alert: {}", e);
-                            }
+                            );
+                            notifier.enqueue_alert(event);
                         }
 
                         if let Err(e) = self_healing.evaluate_and_heal(&decision).await {
@@ -613,21 +607,18 @@ async fn run_daemon(
                         }
 
                         // Informational alert on Jev failure (deduplicated by reason_code: AdvisorUnavailable)
-                        let event = AlertEvent {
-                            source: AlertSource::LocalRule,
-                            target_id: None,
-                            severity: AlertSeverity::Warning,
-                            reason_code: AlertReason::AdvisorUnavailable,
-                            title: "AI Advisor Unavailable".to_string(),
-                            message: format!(
+                        let event = notifier.build_alert_event(
+                            AlertSource::LocalRule,
+                            None,
+                            AlertSeverity::Warning,
+                            AlertReason::AdvisorUnavailable,
+                            "AI Advisor Unavailable".to_string(),
+                            format!(
                                 "AI-рекомендации временно недоступны: {}. Локальный мониторинг активен.",
                                 e
                             ),
-                            timestamp: chrono::Utc::now(),
-                        };
-                        if let Err(err) = alert_tx.try_send(event) {
-                            error!("Alert queue full or closed for advisor failure: {}", err);
-                        }
+                        );
+                        notifier.enqueue_alert(event);
                     }
                 }
             }

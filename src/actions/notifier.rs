@@ -6,7 +6,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 pub fn escape_html(input: &str) -> String {
     input
@@ -67,6 +67,7 @@ pub struct AlertEvent {
     pub target_id: Option<String>,
     pub severity: AlertSeverity,
     pub reason_code: AlertReason,
+    pub generation: u64,
     pub title: String,
     pub message: String,
     pub timestamp: chrono::DateTime<chrono::Utc>,
@@ -79,11 +80,23 @@ pub struct DeduplicationKey {
     pub reason_code: AlertReason,
 }
 
+#[derive(Debug, Clone)]
+pub struct IncidentState {
+    pub current_generation: u64,
+    pub delivered_cooldown: Option<(AlertSeverity, std::time::Instant)>,
+}
+
+#[derive(Default)]
+pub struct DeliveryState {
+    pub incidents: HashMap<DeduplicationKey, IncidentState>,
+    pub pending: HashMap<DeduplicationKey, AlertEvent>,
+}
+
 pub struct Notifier {
     client: Client,
     telegram: Option<TelegramAlertSettings>,
-    delivered_events: Mutex<HashMap<DeduplicationKey, (AlertSeverity, std::time::Instant)>>,
-    incident_generations: Mutex<HashMap<String, u64>>,
+    delivery_state: Mutex<DeliveryState>,
+    notify: tokio::sync::Notify,
 }
 
 impl Notifier {
@@ -132,8 +145,8 @@ impl Notifier {
         Self {
             client,
             telegram,
-            delivered_events: Mutex::new(HashMap::new()),
-            incident_generations: Mutex::new(HashMap::new()),
+            delivery_state: Mutex::new(DeliveryState::default()),
+            notify: tokio::sync::Notify::new(),
         }
     }
 
@@ -141,9 +154,46 @@ impl Notifier {
         self.telegram.is_some()
     }
 
-    pub async fn dispatch_alert_event(&self, event: &AlertEvent) -> Result<bool> {
+    pub fn build_alert_event(
+        &self,
+        source: AlertSource,
+        target_id: Option<String>,
+        severity: AlertSeverity,
+        reason_code: AlertReason,
+        title: impl Into<String>,
+        message: impl Into<String>,
+    ) -> AlertEvent {
+        let title = title.into();
+        let message = message.into();
+        let key = DeduplicationKey {
+            source,
+            target_id: target_id.clone(),
+            reason_code,
+        };
+        let generation = {
+            let mut state = self.delivery_state.lock().unwrap();
+            let inc = state.incidents.entry(key).or_insert_with(|| IncidentState {
+                current_generation: 0,
+                delivered_cooldown: None,
+            });
+            inc.current_generation
+        };
+
+        AlertEvent {
+            source,
+            target_id,
+            severity,
+            reason_code,
+            generation,
+            title,
+            message,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    pub fn enqueue_alert(&self, event: AlertEvent) -> bool {
         let Some(tg) = &self.telegram else {
-            return Ok(false);
+            return false;
         };
 
         let min_sev = tg.min_severity.to_lowercase();
@@ -155,7 +205,7 @@ impl Notifier {
         };
 
         if !should_alert {
-            return Ok(false);
+            return false;
         }
 
         let key = DeduplicationKey {
@@ -164,75 +214,173 @@ impl Notifier {
             reason_code: event.reason_code,
         };
 
-        // Check deduplication: suppress if same or lower severity within 300s cooldown
-        {
-            let delivered = self.delivered_events.lock().unwrap();
-            if let Some((prev_sev, sent_at)) = delivered.get(&key) {
-                if event.severity <= *prev_sev && sent_at.elapsed() < Duration::from_secs(300) {
-                    debug!("Suppressed duplicate alert for {:?}", key);
-                    return Ok(false);
-                }
+        let mut state = self.delivery_state.lock().unwrap();
+        let incident = state
+            .incidents
+            .entry(key.clone())
+            .or_insert_with(|| IncidentState {
+                current_generation: event.generation,
+                delivered_cooldown: None,
+            });
+
+        // Discard obsolete event if target has already recovered/advanced generation
+        if event.generation < incident.current_generation {
+            debug!(
+                "Discarding obsolete event for {:?} (event gen {}, current gen {})",
+                key, event.generation, incident.current_generation
+            );
+            return false;
+        }
+
+        // Suppress duplicate if delivered recently with same or higher severity
+        if let Some((prev_sev, sent_at)) = incident.delivered_cooldown {
+            if event.severity <= prev_sev && sent_at.elapsed() < Duration::from_secs(300) {
+                debug!("Suppressed duplicate alert for {:?}", key);
+                return false;
             }
         }
 
-        // Snapshot generation at the start of HTTP operation to detect target recovery during network delay
-        let starting_gen = if let Some(ref tid) = event.target_id {
-            self.incident_generations
-                .lock()
-                .unwrap()
-                .get(tid)
-                .copied()
-                .unwrap_or(0)
+        // Coalesce into bounded pending table (max 64 entries)
+        if let Some(existing) = state.pending.get_mut(&key) {
+            if event.severity > existing.severity {
+                *existing = event; // Escalate severity!
+            } else {
+                existing.timestamp = event.timestamp;
+                existing.message = event.message;
+            }
         } else {
-            0
+            if state.pending.len() >= 64 {
+                // Priority admission: evict lower severity if available
+                if let Some(evict_key) = state
+                    .pending
+                    .iter()
+                    .filter(|(_, e)| e.severity < event.severity)
+                    .map(|(k, _)| k.clone())
+                    .next()
+                {
+                    state.pending.remove(&evict_key);
+                    state.pending.insert(key, event);
+                } else {
+                    warn!(
+                        "Pending alert table full (64), dropping event for {:?}",
+                        key
+                    );
+                    return false;
+                }
+            } else {
+                state.pending.insert(key, event);
+            }
+        }
+
+        self.notify.notify_one();
+        true
+    }
+
+    pub fn pop_next_pending(&self) -> Option<AlertEvent> {
+        let mut state = self.delivery_state.lock().unwrap();
+        if state.pending.is_empty() {
+            return None;
+        }
+
+        // Pick highest severity event (Critical -> Warning -> Info)
+        let key_to_pop = state
+            .pending
+            .iter()
+            .max_by_key(|(_, e)| e.severity)
+            .map(|(k, _)| k.clone())?;
+
+        state.pending.remove(&key_to_pop)
+    }
+
+    pub fn commit_delivery(&self, event: &AlertEvent) -> bool {
+        let key = DeduplicationKey {
+            source: event.source,
+            target_id: event.target_id.clone(),
+            reason_code: event.reason_code,
         };
 
-        let formatted = self.format_alert_event(event);
-        self.send_raw_message(&formatted).await?;
-
-        // Record delivery only if target did not recover while Telegram request was in flight
-        {
-            let current_gen = if let Some(ref tid) = event.target_id {
-                self.incident_generations
-                    .lock()
-                    .unwrap()
-                    .get(tid)
-                    .copied()
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-
-            if current_gen == starting_gen {
-                let mut delivered = self.delivered_events.lock().unwrap();
-                delivered.insert(key, (event.severity, std::time::Instant::now()));
+        let mut state = self.delivery_state.lock().unwrap();
+        if let Some(inc) = state.incidents.get_mut(&key) {
+            if inc.current_generation == event.generation {
+                inc.delivered_cooldown = Some((event.severity, std::time::Instant::now()));
+                debug!(
+                    "Committed delivery for {:?} at generation {}",
+                    key, event.generation
+                );
+                return true;
             } else {
                 debug!(
-                    "Discarded late Telegram ACK for target {:?} (starting_gen={}, current_gen={})",
-                    event.target_id, starting_gen, current_gen
+                    "Discarded late Telegram ACK for {:?}: generation changed from {} to {}",
+                    key, event.generation, inc.current_generation
                 );
             }
         }
-
-        Ok(true)
+        false
     }
 
-    pub fn clear_alert_cooldown(&self, target_id: &str) {
-        if let Ok(mut gens) = self.incident_generations.lock() {
-            let gen = gens.entry(target_id.to_string()).or_insert(0);
-            *gen = gen.wrapping_add(1);
+    pub fn recover_target(&self, target_id: &str) {
+        let mut state = self.delivery_state.lock().unwrap();
+        for (k, inc) in state.incidents.iter_mut() {
+            if k.target_id.as_deref() == Some(target_id) {
+                inc.current_generation = inc.current_generation.wrapping_add(1);
+                inc.delivered_cooldown = None;
+            }
         }
-        if let Ok(mut delivered) = self.delivered_events.lock() {
-            delivered.retain(|k, _| k.target_id.as_deref() != Some(target_id));
-        }
+        state
+            .pending
+            .retain(|k, _| k.target_id.as_deref() != Some(target_id));
     }
 
-    pub fn clear_advisor_cooldown(&self) {
-        if let Ok(mut delivered) = self.delivered_events.lock() {
-            delivered.retain(|k, _| {
-                k.reason_code != AlertReason::AdvisorUnavailable
-                    && k.reason_code != AlertReason::RiskElevated
-            });
+    pub fn recover_advisor_unavailable(&self) {
+        let mut state = self.delivery_state.lock().unwrap();
+        let adv_key = DeduplicationKey {
+            source: AlertSource::LocalRule,
+            target_id: None,
+            reason_code: AlertReason::AdvisorUnavailable,
+        };
+        if let Some(inc) = state.incidents.get_mut(&adv_key) {
+            inc.current_generation = inc.current_generation.wrapping_add(1);
+            inc.delivered_cooldown = None;
+        }
+        state.pending.remove(&adv_key);
+    }
+
+    pub fn recover_risk_elevated(&self) {
+        let mut state = self.delivery_state.lock().unwrap();
+        let risk_key = DeduplicationKey {
+            source: AlertSource::JevAdvisor,
+            target_id: None,
+            reason_code: AlertReason::RiskElevated,
+        };
+        if let Some(inc) = state.incidents.get_mut(&risk_key) {
+            inc.current_generation = inc.current_generation.wrapping_add(1);
+            inc.delivered_cooldown = None;
+        }
+        state.pending.remove(&risk_key);
+    }
+
+    pub async fn run_worker(
+        self: std::sync::Arc<Self>,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
+        loop {
+            tokio::select! {
+                _ = self.notify.notified() => {
+                    while let Some(event) = self.pop_next_pending() {
+                        let formatted = self.format_alert_event(&event);
+                        if let Err(e) = self.send_raw_message(&formatted).await {
+                            error!("Alert delivery failed after retries for {:?}: {}", event.target_id, e);
+                        } else {
+                            self.commit_delivery(&event);
+                        }
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -259,6 +407,15 @@ impl Notifier {
         lines.push("".to_string());
         lines.push(escape_html(&truncate_field(&event.message, 1000)));
         lines.join("\n")
+    }
+
+    pub async fn dispatch_alert_event(&self, event: &AlertEvent) -> Result<bool> {
+        if !self.enqueue_alert(event.clone()) {
+            return Ok(false);
+        }
+        let formatted = self.format_alert_event(event);
+        self.send_raw_message(&formatted).await?;
+        Ok(self.commit_delivery(event))
     }
 
     pub async fn dispatch_decision(
@@ -419,49 +576,75 @@ impl Notifier {
             chunks.push(current_chunk);
         }
 
-        for chunk in chunks {
-            let body = json!({
-                "chat_id": tg.chat_id,
-                "text": chunk,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": true
-            });
+        let mut confirmed_chunks = 0usize;
+        let mut last_err = None;
 
-            let resp = self
-                .client
-                .post(&tg_url)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| {
-                    SentinelError::Action(format!("Network error sending Telegram message: {}", e))
-                })?;
-
-            let status = resp.status();
-            if status.as_u16() == 400 {
-                // Fallback to plain-text send if HTML parse error
-                let fallback_body = json!({
+        for attempt in 0..3 {
+            let mut send_err = None;
+            while confirmed_chunks < chunks.len() {
+                let chunk = &chunks[confirmed_chunks];
+                let body = json!({
                     "chat_id": tg.chat_id,
-                    "text": truncate_field(&chunk, 4096),
+                    "text": chunk,
+                    "parse_mode": "HTML",
                     "disable_web_page_preview": true
                 });
-                let fb_resp = self
-                    .client
-                    .post(&tg_url)
-                    .json(&fallback_body)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        SentinelError::Action(format!("Network error in Telegram fallback: {}", e))
-                    })?;
-                Self::check_telegram_response(fb_resp).await?;
-            } else {
-                Self::check_telegram_response(resp).await?;
+
+                let send_res = self.client.post(&tg_url).json(&body).send().await;
+                let resp = match send_res {
+                    Ok(r) => r,
+                    Err(e) => {
+                        send_err = Some(SentinelError::Action(format!(
+                            "Network error sending Telegram message: {}",
+                            e
+                        )));
+                        break;
+                    }
+                };
+
+                let status = resp.status();
+                let check_res = if status.as_u16() == 400 {
+                    let fallback_body = json!({
+                        "chat_id": tg.chat_id,
+                        "text": truncate_field(chunk, 4096),
+                        "disable_web_page_preview": true
+                    });
+                    match self.client.post(&tg_url).json(&fallback_body).send().await {
+                        Ok(fb_resp) => Self::check_telegram_response(fb_resp).await,
+                        Err(e) => Err(SentinelError::Action(format!(
+                            "Network error in Telegram fallback: {}",
+                            e
+                        ))),
+                    }
+                } else {
+                    Self::check_telegram_response(resp).await
+                };
+
+                match check_res {
+                    Ok(()) => {
+                        confirmed_chunks += 1;
+                    }
+                    Err(e) => {
+                        send_err = Some(e);
+                        break;
+                    }
+                }
+            }
+
+            if confirmed_chunks == chunks.len() {
+                info!("Dispatched Telegram notification to chat '{}'", tg.chat_id);
+                return Ok(());
+            }
+
+            last_err = send_err;
+            if attempt < 2 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
         }
 
-        info!("Dispatched Telegram notification to chat '{}'", tg.chat_id);
-        Ok(())
+        Err(last_err.unwrap_or_else(|| {
+            SentinelError::Action("Failed to deliver alert after retries".into())
+        }))
     }
 
     async fn check_telegram_response(resp: reqwest::Response) -> Result<()> {
@@ -658,84 +841,66 @@ mod tests {
             proxy: None,
         }));
 
-        let event = AlertEvent {
-            source: AlertSource::LocalRule,
-            target_id: Some("server-1".to_string()),
-            severity: AlertSeverity::Warning,
-            reason_code: AlertReason::ServiceDegraded,
-            title: "Service Degraded".to_string(),
-            message: "High latency detected".to_string(),
-            timestamp: chrono::Utc::now(),
-        };
+        let event = notifier.build_alert_event(
+            AlertSource::LocalRule,
+            Some("server-1".to_string()),
+            AlertSeverity::Warning,
+            AlertReason::ServiceDegraded,
+            "Service Degraded".to_string(),
+            "High latency detected".to_string(),
+        );
 
-        let key = DeduplicationKey {
-            source: event.source,
-            target_id: event.target_id.clone(),
-            reason_code: event.reason_code,
-        };
+        // 1. Initial enqueue succeeds
+        assert!(notifier.enqueue_alert(event.clone()));
 
-        // 1. Manually insert delivery record
-        {
-            let mut delivered = notifier.delivered_events.lock().unwrap();
-            delivered.insert(
-                key.clone(),
-                (AlertSeverity::Warning, std::time::Instant::now()),
-            );
-        }
+        // 2. Commit delivery
+        assert!(notifier.commit_delivery(&event));
 
-        // 2. Same severity within cooldown -> suppressed
-        {
-            let delivered = notifier.delivered_events.lock().unwrap();
-            let (prev_sev, sent_at) = delivered.get(&key).unwrap();
-            assert!(event.severity <= *prev_sev && sent_at.elapsed() < Duration::from_secs(300));
-        }
+        // 3. Same severity within cooldown -> suppressed
+        assert!(!notifier.enqueue_alert(event.clone()));
 
-        // 3. Escalation to Critical -> not suppressed
+        // 4. Escalation to Critical -> not suppressed
         let crit_event = AlertEvent {
             severity: AlertSeverity::Critical,
             ..event.clone()
         };
-        {
-            let delivered = notifier.delivered_events.lock().unwrap();
-            let (prev_sev, _) = delivered.get(&key).unwrap();
-            assert!(!(crit_event.severity <= *prev_sev));
-        }
+        assert!(notifier.enqueue_alert(crit_event));
 
-        // 4. Target recovery clears cooldown
-        notifier.clear_alert_cooldown("server-1");
-        {
-            let delivered = notifier.delivered_events.lock().unwrap();
-            assert!(!delivered.contains_key(&key));
-        }
+        // 5. Target recovery clears cooldown and cancels pending
+        notifier.recover_target("server-1");
+        // Next event has new generation and is admitted immediately
+        let new_event = notifier.build_alert_event(
+            AlertSource::LocalRule,
+            Some("server-1".to_string()),
+            AlertSeverity::Warning,
+            AlertReason::ServiceDegraded,
+            "Service Degraded".to_string(),
+            "High latency detected".to_string(),
+        );
+        assert!(notifier.enqueue_alert(new_event));
 
-        // 5. Advisor recovery clears both advisor unavailable AND risk elevated cooldown
-        let adv_key = DeduplicationKey {
-            source: AlertSource::LocalRule,
-            target_id: None,
-            reason_code: AlertReason::AdvisorUnavailable,
-        };
-        let risk_key = DeduplicationKey {
-            source: AlertSource::JevAdvisor,
-            target_id: None,
-            reason_code: AlertReason::RiskElevated,
-        };
-        {
-            let mut delivered = notifier.delivered_events.lock().unwrap();
-            delivered.insert(
-                adv_key.clone(),
-                (AlertSeverity::Warning, std::time::Instant::now()),
-            );
-            delivered.insert(
-                risk_key.clone(),
-                (AlertSeverity::Critical, std::time::Instant::now()),
-            );
-        }
-        notifier.clear_advisor_cooldown();
-        {
-            let delivered = notifier.delivered_events.lock().unwrap();
-            assert!(!delivered.contains_key(&adv_key));
-            assert!(!delivered.contains_key(&risk_key));
-        }
+        // 6. Advisor recovery clears both advisor unavailable AND risk elevated cooldown
+        let adv_event = notifier.build_alert_event(
+            AlertSource::LocalRule,
+            None,
+            AlertSeverity::Warning,
+            AlertReason::AdvisorUnavailable,
+            "Advisor Unavailable".to_string(),
+            "Network timeout".to_string(),
+        );
+        assert!(notifier.enqueue_alert(adv_event.clone()));
+        notifier.commit_delivery(&adv_event);
+        assert!(!notifier.enqueue_alert(adv_event.clone())); // suppressed
+        notifier.recover_advisor_unavailable();
+        let fresh_adv = notifier.build_alert_event(
+            AlertSource::LocalRule,
+            None,
+            AlertSeverity::Warning,
+            AlertReason::AdvisorUnavailable,
+            "Advisor Unavailable".to_string(),
+            "Network timeout".to_string(),
+        );
+        assert!(notifier.enqueue_alert(fresh_adv)); // allowed after recovery
     }
 
     #[test]
@@ -748,59 +913,130 @@ mod tests {
         }));
 
         let target_id = "node-A";
-        let key = DeduplicationKey {
-            source: AlertSource::LocalRule,
-            target_id: Some(target_id.to_string()),
-            reason_code: AlertReason::ServiceCheckFailed,
-        };
 
-        // t0: Incident 1 begins. Snapshot starting generation = 0
-        let starting_gen = notifier
-            .incident_generations
-            .lock()
-            .unwrap()
-            .get(target_id)
-            .copied()
-            .unwrap_or(0);
-        assert_eq!(starting_gen, 0);
+        // t0: Incident 1 begins. Generation is stamped onto event at creation
+        let i1 = notifier.build_alert_event(
+            AlertSource::LocalRule,
+            Some(target_id.to_string()),
+            AlertSeverity::Warning,
+            AlertReason::ServiceCheckFailed,
+            "Service Check Failed".to_string(),
+            "Error 500".to_string(),
+        );
+        assert_eq!(i1.generation, 0);
 
-        // t1: Target recovers! clear_alert_cooldown increments generation to 1 and clears delivered
-        notifier.clear_alert_cooldown(target_id);
-        let current_gen = notifier
-            .incident_generations
-            .lock()
-            .unwrap()
-            .get(target_id)
-            .copied()
-            .unwrap_or(0);
-        assert_eq!(current_gen, 1);
+        // t1: Target recovers while HTTP is in flight!
+        notifier.recover_target(target_id);
 
         // t2: Late HTTP response for Incident 1 arrives.
-        // Worker compares current_gen (1) with starting_gen (0) -> they differ!
-        // Late ACK is discarded, does NOT insert cooldown for target!
-        if current_gen == starting_gen {
-            let mut delivered = notifier.delivered_events.lock().unwrap();
-            delivered.insert(
-                key.clone(),
-                (AlertSeverity::Warning, std::time::Instant::now()),
+        // commit_delivery sees that target's generation is now 1, discarding late ACK
+        assert!(!notifier.commit_delivery(&i1));
+
+        // t3: Target fails again (Incident 2)!
+        let i2 = notifier.build_alert_event(
+            AlertSource::LocalRule,
+            Some(target_id.to_string()),
+            AlertSeverity::Warning,
+            AlertReason::ServiceCheckFailed,
+            "Service Check Failed".to_string(),
+            "Error 500".to_string(),
+        );
+        assert_eq!(i2.generation, 1);
+
+        // Incident 2 must NOT be suppressed!
+        assert!(
+            notifier.enqueue_alert(i2),
+            "Incident 2 must not be suppressed by late ACK of Incident 1"
+        );
+    }
+
+    #[test]
+    fn test_pending_coalescing_and_priority_admission() {
+        let notifier = Notifier::new(Some(TelegramAlertSettings {
+            bot_token: "fake-token".to_string(),
+            chat_id: "123456".to_string(),
+            min_severity: "warning".to_string(),
+            proxy: None,
+        }));
+
+        let warn_event = notifier.build_alert_event(
+            AlertSource::LocalRule,
+            Some("node-A".to_string()),
+            AlertSeverity::Warning,
+            AlertReason::ServiceDegraded,
+            "Degraded".to_string(),
+            "Load high".to_string(),
+        );
+
+        // Enqueue 128 duplicates of the same event: they must coalesce into 1 pending entry!
+        for _ in 0..128 {
+            assert!(notifier.enqueue_alert(warn_event.clone()));
+        }
+
+        {
+            let state = notifier.delivery_state.lock().unwrap();
+            assert_eq!(
+                state.pending.len(),
+                1,
+                "Duplicates must coalesce into 1 pending slot"
             );
         }
 
-        // Delivered events must be empty!
-        {
-            let delivered = notifier.delivered_events.lock().unwrap();
-            assert!(!delivered.contains_key(&key));
-        }
-
-        // t3: Target fails again (Incident 2)!
-        // Since delivered_events has no record, Incident 2 is NOT suppressed!
-        let second_incident_allowed = {
-            let delivered = notifier.delivered_events.lock().unwrap();
-            !delivered.contains_key(&key)
-        };
-        assert!(
-            second_incident_allowed,
-            "Incident 2 must not be suppressed by late ACK of Incident 1"
+        // A new Critical event arrives: must be admitted and prioritized over Warning!
+        let crit_event = notifier.build_alert_event(
+            AlertSource::JevAdvisor,
+            None,
+            AlertSeverity::Critical,
+            AlertReason::RiskElevated,
+            "Critical Outage".to_string(),
+            "Urgent action required".to_string(),
         );
+        assert!(notifier.enqueue_alert(crit_event));
+
+        // Next popped pending event must be the Critical one!
+        let popped = notifier
+            .pop_next_pending()
+            .expect("Must have pending event");
+        assert_eq!(popped.severity, AlertSeverity::Critical);
+    }
+
+    #[test]
+    fn test_risk_elevated_recovery_and_repeated_critical() {
+        let notifier = Notifier::new(Some(TelegramAlertSettings {
+            bot_token: "fake-token".to_string(),
+            chat_id: "123456".to_string(),
+            min_severity: "warning".to_string(),
+            proxy: None,
+        }));
+
+        let crit = notifier.build_alert_event(
+            AlertSource::JevAdvisor,
+            None,
+            AlertSeverity::Critical,
+            AlertReason::RiskElevated,
+            "Critical".to_string(),
+            "OOM imminent".to_string(),
+        );
+
+        // 1. First critical alert is admitted and committed
+        assert!(notifier.enqueue_alert(crit.clone()));
+        assert!(notifier.commit_delivery(&crit));
+
+        // 2. Continuing critical condition at t=60: must be suppressed within 300s cooldown!
+        assert!(!notifier.enqueue_alert(crit.clone()));
+
+        // 3. Jev reports healthy (risk normalized): recover_risk_elevated clears the cooldown
+        notifier.recover_risk_elevated();
+
+        // 4. A new critical risk arrives: must be admitted immediately!
+        let crit_fresh = notifier.build_alert_event(
+            AlertSource::JevAdvisor,
+            None,
+            AlertSeverity::Critical,
+            AlertReason::RiskElevated,
+            "Critical".to_string(),
+            "OOM imminent".to_string(),
+        );
+        assert!(notifier.enqueue_alert(crit_fresh));
     }
 }
