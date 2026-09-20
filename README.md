@@ -47,7 +47,7 @@ git clone https://github.com/PavelLizunov/jev-sentinel.git
 cd jev-sentinel
 cargo build --release
 
-# The single stripped static binary is in:
+# Inspect the built binary (linkage depends on the build target):
 ./target/release/jev-sentinel --help
 ```
 
@@ -67,7 +67,7 @@ export TYPESAFE_API_KEY="your-typesafe-api-key"
 ./target/release/jev-sentinel check --config sentinel.yaml
 ```
 
-Output example:
+Illustrative output only; these values are not a current infrastructure measurement:
 ```text
 =========================================================
        Jev Sentinel — System 1 Infrastructure Check       
@@ -131,11 +131,11 @@ alerting:
     min_severity: "warning" # info, warning, critical
 
 self_healing:
-  enabled: true
+  enabled: false # Logging-only today; there is no command executor
   allowed_services:
     - "osaurus"
     - "caddy"
-  require_confirmation: false
+  require_confirmation: true # Not an implemented approval workflow
 
 targets:
   - type: macos_ssh
