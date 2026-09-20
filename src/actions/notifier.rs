@@ -83,6 +83,7 @@ pub struct Notifier {
     client: Client,
     telegram: Option<TelegramAlertSettings>,
     delivered_events: Mutex<HashMap<DeduplicationKey, (AlertSeverity, std::time::Instant)>>,
+    incident_generations: Mutex<HashMap<String, u64>>,
 }
 
 impl Notifier {
@@ -132,6 +133,7 @@ impl Notifier {
             client,
             telegram,
             delivered_events: Mutex::new(HashMap::new()),
+            incident_generations: Mutex::new(HashMap::new()),
         }
     }
 
@@ -173,19 +175,53 @@ impl Notifier {
             }
         }
 
+        // Snapshot generation at the start of HTTP operation to detect target recovery during network delay
+        let starting_gen = if let Some(ref tid) = event.target_id {
+            self.incident_generations
+                .lock()
+                .unwrap()
+                .get(tid)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
         let formatted = self.format_alert_event(event);
         self.send_raw_message(&formatted).await?;
 
-        // Record delivery only after Telegram confirms success
+        // Record delivery only if target did not recover while Telegram request was in flight
         {
-            let mut delivered = self.delivered_events.lock().unwrap();
-            delivered.insert(key, (event.severity, std::time::Instant::now()));
+            let current_gen = if let Some(ref tid) = event.target_id {
+                self.incident_generations
+                    .lock()
+                    .unwrap()
+                    .get(tid)
+                    .copied()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+
+            if current_gen == starting_gen {
+                let mut delivered = self.delivered_events.lock().unwrap();
+                delivered.insert(key, (event.severity, std::time::Instant::now()));
+            } else {
+                debug!(
+                    "Discarded late Telegram ACK for target {:?} (starting_gen={}, current_gen={})",
+                    event.target_id, starting_gen, current_gen
+                );
+            }
         }
 
         Ok(true)
     }
 
     pub fn clear_alert_cooldown(&self, target_id: &str) {
+        if let Ok(mut gens) = self.incident_generations.lock() {
+            let gen = gens.entry(target_id.to_string()).or_insert(0);
+            *gen = gen.wrapping_add(1);
+        }
         if let Ok(mut delivered) = self.delivered_events.lock() {
             delivered.retain(|k, _| k.target_id.as_deref() != Some(target_id));
         }
@@ -193,7 +229,10 @@ impl Notifier {
 
     pub fn clear_advisor_cooldown(&self) {
         if let Ok(mut delivered) = self.delivered_events.lock() {
-            delivered.retain(|k, _| k.reason_code != AlertReason::AdvisorUnavailable);
+            delivered.retain(|k, _| {
+                k.reason_code != AlertReason::AdvisorUnavailable
+                    && k.reason_code != AlertReason::RiskElevated
+            });
         }
     }
 
@@ -669,11 +708,16 @@ mod tests {
             assert!(!delivered.contains_key(&key));
         }
 
-        // 5. Advisor recovery clears advisor cooldown
+        // 5. Advisor recovery clears both advisor unavailable AND risk elevated cooldown
         let adv_key = DeduplicationKey {
             source: AlertSource::LocalRule,
             target_id: None,
             reason_code: AlertReason::AdvisorUnavailable,
+        };
+        let risk_key = DeduplicationKey {
+            source: AlertSource::JevAdvisor,
+            target_id: None,
+            reason_code: AlertReason::RiskElevated,
         };
         {
             let mut delivered = notifier.delivered_events.lock().unwrap();
@@ -681,11 +725,82 @@ mod tests {
                 adv_key.clone(),
                 (AlertSeverity::Warning, std::time::Instant::now()),
             );
+            delivered.insert(
+                risk_key.clone(),
+                (AlertSeverity::Critical, std::time::Instant::now()),
+            );
         }
         notifier.clear_advisor_cooldown();
         {
             let delivered = notifier.delivered_events.lock().unwrap();
             assert!(!delivered.contains_key(&adv_key));
+            assert!(!delivered.contains_key(&risk_key));
         }
+    }
+
+    #[test]
+    fn test_late_ack_race_does_not_suppress_new_incident() {
+        let notifier = Notifier::new(Some(TelegramAlertSettings {
+            bot_token: "fake-token".to_string(),
+            chat_id: "123456".to_string(),
+            min_severity: "warning".to_string(),
+            proxy: None,
+        }));
+
+        let target_id = "node-A";
+        let key = DeduplicationKey {
+            source: AlertSource::LocalRule,
+            target_id: Some(target_id.to_string()),
+            reason_code: AlertReason::ServiceCheckFailed,
+        };
+
+        // t0: Incident 1 begins. Snapshot starting generation = 0
+        let starting_gen = notifier
+            .incident_generations
+            .lock()
+            .unwrap()
+            .get(target_id)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(starting_gen, 0);
+
+        // t1: Target recovers! clear_alert_cooldown increments generation to 1 and clears delivered
+        notifier.clear_alert_cooldown(target_id);
+        let current_gen = notifier
+            .incident_generations
+            .lock()
+            .unwrap()
+            .get(target_id)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(current_gen, 1);
+
+        // t2: Late HTTP response for Incident 1 arrives.
+        // Worker compares current_gen (1) with starting_gen (0) -> they differ!
+        // Late ACK is discarded, does NOT insert cooldown for target!
+        if current_gen == starting_gen {
+            let mut delivered = notifier.delivered_events.lock().unwrap();
+            delivered.insert(
+                key.clone(),
+                (AlertSeverity::Warning, std::time::Instant::now()),
+            );
+        }
+
+        // Delivered events must be empty!
+        {
+            let delivered = notifier.delivered_events.lock().unwrap();
+            assert!(!delivered.contains_key(&key));
+        }
+
+        // t3: Target fails again (Incident 2)!
+        // Since delivered_events has no record, Incident 2 is NOT suppressed!
+        let second_incident_allowed = {
+            let delivered = notifier.delivered_events.lock().unwrap();
+            !delivered.contains_key(&key)
+        };
+        assert!(
+            second_incident_allowed,
+            "Incident 2 must not be suppressed by late ACK of Incident 1"
+        );
     }
 }

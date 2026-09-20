@@ -146,6 +146,13 @@ pub async fn run_web_server_with_listener(
     Ok(())
 }
 
+fn is_valid_field_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
 async fn handle_connection(
     mut stream: TcpStream,
     status_rx: watch::Receiver<Arc<PublishedStatus>>,
@@ -240,15 +247,15 @@ async fn handle_connection(
             continue;
         }
 
-        // RFC 9112 Section 5.1: No whitespace is allowed between the field-name and colon
+        // RFC 9112 Section 5.1 & RFC 9110 Section 5.1/5.6.2: Field name must be a valid non-empty token
         let Some((field_name, field_val)) = trimmed_line.split_once(':') else {
-            let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 26\r\nConnection: close\r\n\r\nInvalid Header Field Line";
+            let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 25\r\nConnection: close\r\n\r\nInvalid Header Field Line";
             let _ = timeout(WRITE_TIMEOUT, stream.write_all(resp)).await;
             return Ok(());
         };
 
-        if field_name.bytes().any(|b| b == b' ' || b == b'\t') {
-            let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 28\r\nConnection: close\r\n\r\nInvalid Header Field Syntax";
+        if !is_valid_field_name(field_name) {
+            let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 27\r\nConnection: close\r\n\r\nInvalid Header Field Syntax";
             let _ = timeout(WRITE_TIMEOUT, stream.write_all(resp)).await;
             return Ok(());
         }
@@ -1260,6 +1267,47 @@ mod tests {
         client.read_to_string(&mut resp).await.unwrap();
         assert!(resp.contains("400 Bad Request"));
         assert!(resp.contains("Invalid Content-Length"));
+
+        // 8d. Test empty header field name rejected
+        let mut client = TcpStream::connect(&addr).await.unwrap();
+        let req =
+            "DELETE /api/categories?id=ai_compute HTTP/1.1\r\nHost: localhost\r\n: value\r\n\r\n";
+        client.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.contains("400 Bad Request"));
+        assert!(resp.contains("Invalid Header Field Syntax"));
+        assert!(resp.contains("Content-Length: 27"));
+
+        // 8e. Test NUL byte in header field name rejected
+        let mut client = TcpStream::connect(&addr).await.unwrap();
+        let req = b"DELETE /api/categories?id=ai_compute HTTP/1.1\r\nHost: localhost\r\nContent-Length\x00: 0:garbage\r\n\r\n";
+        client.write_all(req).await.unwrap();
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.contains("400 Bad Request"));
+        assert!(resp.contains("Invalid Header Field Syntax"));
+        assert!(resp.contains("Content-Length: 27"));
+
+        // 8f. Test vertical tab in header field name rejected
+        let mut client = TcpStream::connect(&addr).await.unwrap();
+        let req = b"DELETE /api/categories?id=ai_compute HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding\x0b: chunked\r\n\r\n";
+        client.write_all(req).await.unwrap();
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.contains("400 Bad Request"));
+        assert!(resp.contains("Invalid Header Field Syntax"));
+        assert!(resp.contains("Content-Length: 27"));
+
+        // 8g. Test parenthesis in header field name rejected
+        let mut client = TcpStream::connect(&addr).await.unwrap();
+        let req = "DELETE /api/categories?id=ai_compute HTTP/1.1\r\nHost: localhost\r\nX(Bad): value\r\n\r\n";
+        client.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.contains("400 Bad Request"));
+        assert!(resp.contains("Invalid Header Field Syntax"));
+        assert!(resp.contains("Content-Length: 27"));
 
         // 9a. Test whitespace before colon in Transfer-Encoding rejected
         let mut client = TcpStream::connect(&addr).await.unwrap();

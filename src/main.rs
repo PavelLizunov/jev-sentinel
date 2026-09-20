@@ -561,22 +561,35 @@ async fn run_daemon(
                         notifier.clear_advisor_cooldown();
 
                         // Route routine Jev alert through background queue with deduplication
-                        if decision.is_warning() || decision.is_critical() {
+                        let is_info = config
+                            .alerting
+                            .telegram
+                            .as_ref()
+                            .is_some_and(|tg| tg.min_severity.eq_ignore_ascii_case("info"));
+
+                        if is_info || decision.is_warning() || decision.is_critical() {
+                            let conf_text = match decision.health_confidence {
+                                Some(c) => format!(". Уверенность: {:.0}%", c * 100.0),
+                                None => String::new(),
+                            };
                             let event = AlertEvent {
                                 source: AlertSource::JevAdvisor,
                                 target_id: None,
                                 severity: if decision.is_critical() {
                                     AlertSeverity::Critical
-                                } else {
+                                } else if decision.is_warning() {
                                     AlertSeverity::Warning
+                                } else {
+                                    AlertSeverity::Info
                                 },
                                 reason_code: AlertReason::RiskElevated,
-                                title: format!("Jev System 1: {}", decision.system_health.to_uppercase()),
+                                title: format!(
+                                    "Jev System 1: {}",
+                                    decision.system_health.to_uppercase()
+                                ),
                                 message: format!(
-                                    "Оценка риска: {:.2} / 1.00. Рекомендация: {}. Уверенность: {:.0}%",
-                                    decision.risk_score,
-                                    decision.suggested_action,
-                                    decision.health_confidence.unwrap_or(0.0) * 100.0
+                                    "Оценка риска: {:.2} / 1.00. Рекомендация: {}{}",
+                                    decision.risk_score, decision.suggested_action, conf_text
                                 ),
                                 timestamp: chrono::Utc::now(),
                             };
