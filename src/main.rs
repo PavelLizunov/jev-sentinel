@@ -428,21 +428,56 @@ async fn run_daemon(
                 let snapshot = collect_all(&config.targets, config.daemon.concurrency).await;
                 let collect_latency_ms = t_collect.elapsed().as_secs_f64() * 1000.0;
 
-                // 1. Autonomous local alerts dispatched immediately based on raw observations
+                // 1. Immediately publish fresh telemetry to Web Dashboard so notifications cannot delay observations
+                if config.web.enabled {
+                    let mut next = dashboard_history.observe(cycle_id, &snapshot, collect_latency_ms);
+                    status_tx.send_modify(|current| {
+                        next.categories = current.categories.clone();
+                        for target in &mut next.targets {
+                            target.category = current.targets.iter().find(|t| t.id == target.id).and_then(|t| t.category.clone());
+                        }
+                        next.view_revision = current.view_revision.parse::<u64>().unwrap_or(0).saturating_add(1).to_string();
+                        *current = Arc::new(next);
+                    });
+                }
+
+                // 2. Autonomous local alerts dispatched based on raw observations
                 for target in &snapshot.targets {
                     if target.status != TargetStatus::Online {
                         let (sev, reason, title, msg) = match target.status {
-                            TargetStatus::Timeout | TargetStatus::Unreachable => (
+                            TargetStatus::Timeout => (
                                 AlertSeverity::Warning,
                                 AlertReason::ObservationUnavailable,
                                 "Observation Unavailable",
                                 format!(
-                                    "Не удалось проверить цель '{}' ({}): {}",
-                                    target.target_name,
-                                    target.target_type,
-                                    target.error_message.as_deref().unwrap_or("таймаут/недоступен")
+                                    "Не удалось проверить цель '{}' ({}): таймаут",
+                                    target.target_name, target.target_type
                                 ),
                             ),
+                            TargetStatus::Unreachable => {
+                                let err_text = target.error_message.as_deref().unwrap_or("недоступен");
+                                if err_text.contains("Unexpected HTTP status") {
+                                    (
+                                        AlertSeverity::Warning,
+                                        AlertReason::ServiceCheckFailed,
+                                        "Service Check Failed",
+                                        format!(
+                                            "Проверка сервиса '{}' зафиксировала ошибку: {}",
+                                            target.target_name, err_text
+                                        ),
+                                    )
+                                } else {
+                                    (
+                                        AlertSeverity::Warning,
+                                        AlertReason::ObservationUnavailable,
+                                        "Observation Unavailable",
+                                        format!(
+                                            "Не удалось проверить цель '{}' ({}): {}",
+                                            target.target_name, target.target_type, err_text
+                                        ),
+                                    )
+                                }
+                            }
                             TargetStatus::Degraded => (
                                 AlertSeverity::Warning,
                                 AlertReason::ServiceDegraded,
@@ -486,18 +521,6 @@ async fn run_daemon(
                     }
                 }
 
-                if config.web.enabled {
-                    let mut next = dashboard_history.observe(cycle_id, &snapshot, collect_latency_ms);
-                    status_tx.send_modify(|current| {
-                        next.categories = current.categories.clone();
-                        for target in &mut next.targets {
-                            target.category = current.targets.iter().find(|t| t.id == target.id).and_then(|t| t.category.clone());
-                        }
-                        next.view_revision = current.view_revision.parse::<u64>().unwrap_or(0).saturating_add(1).to_string();
-                        *current = Arc::new(next);
-                    });
-                }
-
                 let t_eval = std::time::Instant::now();
                 match jev_client.evaluate_snapshot(&snapshot).await {
                     Ok(decision) => {
@@ -517,6 +540,9 @@ async fn run_daemon(
                                 next.view_revision = next.view_revision.parse::<u64>().unwrap_or(0).saturating_add(1).to_string();
                             });
                         }
+
+                        // Reset advisor cooldown upon successful recovery
+                        notifier.clear_advisor_cooldown();
 
                         if let Err(e) = notifier.dispatch_decision(&decision, &snapshot).await {
                             error!("Notifier error: {}", e);

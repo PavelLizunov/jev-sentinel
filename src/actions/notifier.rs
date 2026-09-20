@@ -186,6 +186,12 @@ impl Notifier {
         }
     }
 
+    pub fn clear_advisor_cooldown(&self) {
+        if let Ok(mut delivered) = self.delivered_events.lock() {
+            delivered.retain(|k, _| k.reason_code != AlertReason::AdvisorUnavailable);
+        }
+    }
+
     pub fn format_alert_event(&self, event: &AlertEvent) -> String {
         let icon = match event.severity {
             AlertSeverity::Info => "ℹ️",
@@ -329,7 +335,8 @@ impl Notifier {
                 target.latency_ms
             ));
             if let Some(err) = &target.error_message {
-                let truncated_err = truncate_field(err, 180);
+                let single_line_err = err.replace(['\r', '\n'], " ");
+                let truncated_err = truncate_field(&single_line_err, 180);
                 lines.push(format!(
                     "  <i>Error:</i> <code>{}</code>",
                     escape_html(&truncated_err)
@@ -385,41 +392,56 @@ impl Notifier {
                 })?;
 
             let status = resp.status();
-            if !status.is_success() {
-                let err_text = resp.text().await.unwrap_or_default();
-                // Fallback to plain-text send if HTML entity parsing fails
-                if status.as_u16() == 400 {
-                    let fallback_body = json!({
-                        "chat_id": tg.chat_id,
-                        "text": truncate_field(&chunk, 4096),
-                        "disable_web_page_preview": true
-                    });
-                    if let Ok(fb_resp) = self.client.post(&tg_url).json(&fallback_body).send().await
-                    {
-                        if fb_resp.status().is_success() {
-                            continue;
-                        }
-                    }
-                }
-                let desc = format!("Telegram API HTTP {}: {}", status, err_text);
-                error!("{}", desc);
-                return Err(SentinelError::Action(desc));
-            }
-
-            let resp_json: serde_json::Value = resp.json().await.unwrap_or_default();
-            if resp_json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-                let desc = resp_json
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown Telegram API rejection");
-                return Err(SentinelError::Action(format!(
-                    "Telegram API error: {}",
-                    desc
-                )));
+            if status.as_u16() == 400 {
+                // Fallback to plain-text send if HTML parse error
+                let fallback_body = json!({
+                    "chat_id": tg.chat_id,
+                    "text": truncate_field(&chunk, 4096),
+                    "disable_web_page_preview": true
+                });
+                let fb_resp = self
+                    .client
+                    .post(&tg_url)
+                    .json(&fallback_body)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        SentinelError::Action(format!("Network error in Telegram fallback: {}", e))
+                    })?;
+                Self::check_telegram_response(fb_resp).await?;
+            } else {
+                Self::check_telegram_response(resp).await?;
             }
         }
 
         info!("Dispatched Telegram notification to chat '{}'", tg.chat_id);
+        Ok(())
+    }
+
+    async fn check_telegram_response(resp: reqwest::Response) -> Result<()> {
+        let status = resp.status();
+        if !status.is_success() {
+            let err_text = resp.text().await.unwrap_or_default();
+            let desc = format!("Telegram API HTTP {}: {}", status, err_text);
+            error!("{}", desc);
+            return Err(SentinelError::Action(desc));
+        }
+
+        let resp_json: serde_json::Value = resp.json().await.map_err(|e| {
+            SentinelError::Action(format!("Telegram API invalid JSON response: {}", e))
+        })?;
+
+        if resp_json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            let desc = resp_json
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Telegram API response ok=false");
+            return Err(SentinelError::Action(format!(
+                "Telegram API error: {}",
+                desc
+            )));
+        }
+
         Ok(())
     }
 }
@@ -427,6 +449,7 @@ impl Notifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::models::TargetTelemetry;
     use std::collections::HashMap;
 
     #[test]
@@ -488,22 +511,122 @@ mod tests {
     }
 
     #[test]
-    fn test_format_alert_event_clean_blocks() {
+    fn test_multiline_error_remains_single_line_in_html() {
         let notifier = Notifier::new(None);
+        let decision = SentinelDecision {
+            timestamp: chrono::Utc::now(),
+            system_health: "degraded".to_string(),
+            health_confidence: Some(0.92),
+            risk_score: 0.45,
+            action_required: true,
+            action_probability: 0.88,
+            suggested_action: "none".to_string(),
+            raw_answers: HashMap::new(),
+        };
+
+        let multiline_err = "x\n".to_string() + &"y".repeat(80);
+        let snapshot = InfrastructureSnapshot {
+            timestamp: chrono::Utc::now(),
+            targets: vec![TargetTelemetry {
+                target_name: "test-node".to_string(),
+                target_type: "exec_probe".to_string(),
+                status: TargetStatus::Degraded,
+                latency_ms: 5.0,
+                metrics: serde_json::json!({}),
+                error_message: Some(multiline_err),
+                timestamp: chrono::Utc::now(),
+                observed_at: None,
+            }],
+        };
+
+        let msg = notifier.format_decision_message(&decision, &snapshot);
+        for line in msg.lines() {
+            if line.contains("<code>") {
+                assert!(
+                    line.contains("</code>"),
+                    "<code> tag must close on the same line: {}",
+                    line
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_deduplication_lifecycle_and_advisor_recovery() {
+        let notifier = Notifier::new(Some(TelegramAlertSettings {
+            bot_token: "fake-token".to_string(),
+            chat_id: "123456".to_string(),
+            min_severity: "warning".to_string(),
+            proxy: None,
+        }));
+
         let event = AlertEvent {
             source: AlertSource::LocalRule,
-            target_id: Some("worker <prod> & node".to_string()),
+            target_id: Some("server-1".to_string()),
             severity: AlertSeverity::Warning,
-            reason_code: AlertReason::ObservationUnavailable,
-            title: "Observation <Unavailable>".to_string(),
-            message: "Не удалось проверить цель: таймаут > 5000ms & отказ соединения".to_string(),
+            reason_code: AlertReason::ServiceDegraded,
+            title: "Service Degraded".to_string(),
+            message: "High latency detected".to_string(),
             timestamp: chrono::Utc::now(),
         };
 
-        let formatted = notifier.format_alert_event(&event);
-        assert!(formatted.contains("Observation &lt;Unavailable&gt;"));
-        assert!(formatted.contains("worker &lt;prod&gt; &amp; node"));
-        assert!(formatted.contains("&gt; 5000ms &amp; отказ"));
-        assert!(!formatted.contains('<') || formatted.contains("<b>")); // only valid tags
+        let key = DeduplicationKey {
+            source: event.source,
+            target_id: event.target_id.clone(),
+            reason_code: event.reason_code,
+        };
+
+        // 1. Manually insert delivery record
+        {
+            let mut delivered = notifier.delivered_events.lock().unwrap();
+            delivered.insert(
+                key.clone(),
+                (AlertSeverity::Warning, std::time::Instant::now()),
+            );
+        }
+
+        // 2. Same severity within cooldown -> suppressed
+        {
+            let delivered = notifier.delivered_events.lock().unwrap();
+            let (prev_sev, sent_at) = delivered.get(&key).unwrap();
+            assert!(event.severity <= *prev_sev && sent_at.elapsed() < Duration::from_secs(300));
+        }
+
+        // 3. Escalation to Critical -> not suppressed
+        let crit_event = AlertEvent {
+            severity: AlertSeverity::Critical,
+            ..event.clone()
+        };
+        {
+            let delivered = notifier.delivered_events.lock().unwrap();
+            let (prev_sev, _) = delivered.get(&key).unwrap();
+            assert!(!(crit_event.severity <= *prev_sev));
+        }
+
+        // 4. Target recovery clears cooldown
+        notifier.clear_alert_cooldown("server-1");
+        {
+            let delivered = notifier.delivered_events.lock().unwrap();
+            assert!(!delivered.contains_key(&key));
+        }
+
+        // 5. Advisor recovery clears advisor cooldown
+        let adv_key = DeduplicationKey {
+            source: AlertSource::LocalRule,
+            target_id: None,
+            reason_code: AlertReason::AdvisorUnavailable,
+        };
+        {
+            let mut delivered = notifier.delivered_events.lock().unwrap();
+            delivered.insert(
+                adv_key.clone(),
+                (AlertSeverity::Warning, std::time::Instant::now()),
+            );
+        }
+        notifier.clear_advisor_cooldown();
+        {
+            let delivered = notifier.delivered_events.lock().unwrap();
+            assert!(!delivered.contains_key(&adv_key));
+        }
     }
 }

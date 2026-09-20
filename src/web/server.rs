@@ -192,12 +192,15 @@ async fn handle_connection(
         return Ok(());
     }
 
-    let header_end_pos = buf.windows(4).position(|w| w == b"\r\n\r\n");
-    let header_str = if let Some(pos) = header_end_pos {
-        String::from_utf8_lossy(&buf[..pos]).to_string()
-    } else {
-        String::from_utf8_lossy(&buf).to_string()
+    let header_end_pos = match buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(pos) => pos,
+        None => {
+            let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 26\r\nConnection: close\r\n\r\nIncomplete Request Headers";
+            let _ = timeout(WRITE_TIMEOUT, stream.write_all(resp)).await;
+            return Ok(());
+        }
     };
+    let header_str = String::from_utf8_lossy(&buf[..header_end_pos]).to_string();
 
     let request_line = match header_str.lines().next() {
         Some(l) => l.trim(),
@@ -246,13 +249,18 @@ async fn handle_connection(
         }
 
         let content_length = if cl_headers.len() == 1 {
-            match cl_headers[0]
-                .split(':')
-                .nth(1)
-                .and_then(|v| v.trim().parse::<usize>().ok())
-            {
-                Some(len) => len,
-                None => {
+            let cl_val = cl_headers[0]
+                .split_once(':')
+                .map(|(_, v)| v.trim())
+                .unwrap_or("");
+            if cl_val.is_empty() || !cl_val.bytes().all(|b| b.is_ascii_digit()) {
+                let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 22\r\nConnection: close\r\n\r\nInvalid Content-Length";
+                let _ = timeout(WRITE_TIMEOUT, stream.write_all(resp)).await;
+                return Ok(());
+            }
+            match cl_val.parse::<usize>() {
+                Ok(len) => len,
+                Err(_) => {
                     let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 22\r\nConnection: close\r\n\r\nInvalid Content-Length";
                     let _ = timeout(WRITE_TIMEOUT, stream.write_all(resp)).await;
                     return Ok(());
@@ -269,11 +277,9 @@ async fn handle_connection(
         }
 
         // Bound leftover bytes strictly to content_length
-        if let Some(pos) = header_end_pos {
-            let leftover = &buf[pos + 4..];
-            let take_len = leftover.len().min(content_length);
-            body_bytes.extend_from_slice(&leftover[..take_len]);
-        }
+        let leftover = &buf[header_end_pos + 4..];
+        let take_len = leftover.len().min(content_length);
+        body_bytes.extend_from_slice(&leftover[..take_len]);
 
         // Read remaining body within dedicated BODY_READ_TIMEOUT
         if body_bytes.len() < content_length {
@@ -1151,6 +1157,16 @@ mod tests {
         assert!(resp.contains("400 Bad Request"));
         assert!(resp.contains("Incomplete Body"));
 
+        // 7a. Test incomplete headers (EOF without \r\n\r\n) rejects without mutating state
+        let mut client = TcpStream::connect(&addr).await.unwrap();
+        let req = "DELETE /api/categories?id=ai_compute HTTP/1.1\r\nHost: localhost\r\n";
+        client.write_all(req.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut resp = String::new();
+        let _ = client.read_to_string(&mut resp).await;
+        assert!(resp.contains("400 Bad Request"));
+        assert!(resp.contains("Incomplete Request Headers"));
+
         // 8. Test duplicate Content-Length rejected
         let mut client = TcpStream::connect(&addr).await.unwrap();
         let req = "POST /api/categories HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\nContent-Length: 10\r\nContent-Type: application/json\r\n\r\n{}";
@@ -1159,6 +1175,25 @@ mod tests {
         client.read_to_string(&mut resp).await.unwrap();
         assert!(resp.contains("400 Bad Request"));
         assert!(resp.contains("Duplicate Content-Length"));
+
+        // 8a. Test malformed Content-Length with colon/garbage rejected without mutating state
+        let mut client = TcpStream::connect(&addr).await.unwrap();
+        let req = "DELETE /api/categories?id=ai_compute HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0:garbage\r\n\r\n";
+        client.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.contains("400 Bad Request"));
+        assert!(resp.contains("Invalid Content-Length"));
+
+        // Verify ai_compute was not deleted by malformed/incomplete requests
+        let mut client = TcpStream::connect(&addr).await.unwrap();
+        client
+            .write_all(b"GET /api/categories HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.contains("ai_compute"));
 
         // 9. Test unsupported Transfer-Encoding rejected
         let mut client = TcpStream::connect(&addr).await.unwrap();

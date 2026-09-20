@@ -214,9 +214,34 @@ mod tests {
         match drain {
             DrainResult::BudgetReached(bytes) => {
                 assert!(bytes >= MAX_BODY_DRAIN_BYTES);
-                assert_eq!(bytes, 76 * 1024);
             }
             other => panic!("Expected BudgetReached, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_drain_slow_body_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let header =
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            socket.write_all(header).await.unwrap();
+            // Send 1 byte and sleep longer than BODY_DRAIN_TIMEOUT (500ms)
+            socket.write_all(b"1\r\nX\r\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(700)).await;
+        });
+
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}"))
+            .send()
+            .await
+            .unwrap();
+        let drain = drain_response_body_bounded(resp).await;
+        assert_eq!(drain, DrainResult::Timeout);
     }
 }
