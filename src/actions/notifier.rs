@@ -29,6 +29,11 @@ pub fn truncate_field(input: &str, max_chars: usize) -> String {
     format!("{prefix}…")
 }
 
+pub fn sanitize_inline_field(input: &str, max_chars: usize) -> String {
+    let single_line = input.replace(['\r', '\n'], " ");
+    truncate_field(&single_line, max_chars)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AlertSource {
@@ -198,12 +203,12 @@ impl Notifier {
             AlertSeverity::Warning => "⚠️",
             AlertSeverity::Critical => "🚨",
         };
-        let safe_title = escape_html(&truncate_field(&event.title, 80));
+        let safe_title = escape_html(&sanitize_inline_field(&event.title, 80));
         let mut lines = vec![format!("<b>{} Jev Sentinel: {}</b>", icon, safe_title)];
         if let Some(ref target) = event.target_id {
             lines.push(format!(
                 "<b>Target:</b> <code>{}</code>",
-                escape_html(&truncate_field(target, 80))
+                escape_html(&sanitize_inline_field(target, 80))
             ));
         }
         lines.push(format!("<b>Severity:</b> {:?}", event.severity));
@@ -303,7 +308,10 @@ impl Notifier {
         lines.push(format!(
             "<b>{} Jev Sentinel Alert: {}</b>",
             icon,
-            escape_html(&decision.system_health.to_uppercase())
+            escape_html(&sanitize_inline_field(
+                &decision.system_health.to_uppercase(),
+                40
+            ))
         ));
         lines.push(format!(
             "<b>Risk score:</b> {:.2} / 1.00",
@@ -311,7 +319,7 @@ impl Notifier {
         ));
         lines.push(format!(
             "<b>Suggested Action:</b> <code>{}</code>",
-            escape_html(&decision.suggested_action)
+            escape_html(&sanitize_inline_field(&decision.suggested_action, 80))
         ));
         if let Some(confidence) = decision.health_confidence {
             lines.push(format!("<b>Confidence:</b> {:.0}%", confidence * 100.0));
@@ -330,13 +338,12 @@ impl Notifier {
             lines.push(format!(
                 "• {} <b>{}</b> ({}): {:.1}ms",
                 status_emoji,
-                escape_html(&target.target_name),
-                escape_html(&target.target_type),
+                escape_html(&sanitize_inline_field(&target.target_name, 60)),
+                escape_html(&sanitize_inline_field(&target.target_type, 30)),
                 target.latency_ms
             ));
             if let Some(err) = &target.error_message {
-                let single_line_err = err.replace(['\r', '\n'], " ");
-                let truncated_err = truncate_field(&single_line_err, 180);
+                let truncated_err = sanitize_inline_field(err, 180);
                 lines.push(format!(
                     "  <i>Error:</i> <code>{}</code>",
                     escape_html(&truncated_err)
@@ -541,6 +548,58 @@ mod tests {
 
         let msg = notifier.format_decision_message(&decision, &snapshot);
         for line in msg.lines() {
+            if line.contains("<code>") {
+                assert!(
+                    line.contains("</code>"),
+                    "<code> tag must close on the same line: {}",
+                    line
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_multiline_target_names_remain_single_line_in_html() {
+        let notifier = Notifier::new(None);
+        let decision = SentinelDecision {
+            timestamp: chrono::Utc::now(),
+            system_health: "degraded".to_string(),
+            health_confidence: Some(0.92),
+            risk_score: 0.45,
+            action_required: true,
+            action_probability: 0.88,
+            suggested_action: "none".to_string(),
+            raw_answers: HashMap::new(),
+        };
+
+        // 29 targets with names containing newlines: "node-i\nzzz"
+        let targets = (0..29)
+            .map(|i| TargetTelemetry {
+                target_name: format!("node-{i}\nzzz"),
+                target_type: "exec_probe".to_string(),
+                status: TargetStatus::Degraded,
+                latency_ms: 1.0,
+                metrics: serde_json::json!({}),
+                error_message: Some("x\n".to_string() + &"y".repeat(80)),
+                timestamp: chrono::Utc::now(),
+                observed_at: None,
+            })
+            .collect();
+
+        let snapshot = InfrastructureSnapshot {
+            timestamp: chrono::Utc::now(),
+            targets,
+        };
+
+        let msg = notifier.format_decision_message(&decision, &snapshot);
+        for line in msg.lines() {
+            if line.contains("<b>") {
+                assert!(
+                    line.contains("</b>"),
+                    "<b> tag must close on the same line: {}",
+                    line
+                );
+            }
             if line.contains("<code>") {
                 assert!(
                     line.contains("</code>"),

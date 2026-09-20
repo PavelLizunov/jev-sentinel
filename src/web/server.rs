@@ -163,16 +163,21 @@ async fn handle_connection(
             if n == 0 {
                 break;
             }
-            if buf.len() + n > MAX_HEADER_SIZE {
+            buf.extend_from_slice(&chunk[..n]);
+
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                if pos + 4 > MAX_HEADER_SIZE {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Header size exceeded limit",
+                    ));
+                }
+                break;
+            } else if buf.len() > MAX_HEADER_SIZE {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "Header size exceeded limit",
                 ));
-            }
-            buf.extend_from_slice(&chunk[..n]);
-
-            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
             }
         }
         Ok::<_, std::io::Error>(())
@@ -202,7 +207,8 @@ async fn handle_connection(
     };
     let header_str = String::from_utf8_lossy(&buf[..header_end_pos]).to_string();
 
-    let request_line = match header_str.lines().next() {
+    let mut header_lines = header_str.lines();
+    let request_line = match header_lines.next() {
         Some(l) => l.trim(),
         None => {
             let resp =
@@ -224,51 +230,66 @@ async fn handle_connection(
     let clean_path = path.split('?').next().unwrap_or(path);
     let is_head = method == "HEAD";
 
-    // Read POST/DELETE body if applicable
-    let mut body_bytes = Vec::new();
-    if method == "POST" || method == "DELETE" {
-        // 1. Framing checks: reject unsupported Transfer-Encoding
-        if header_str
-            .lines()
-            .any(|l| l.to_lowercase().starts_with("transfer-encoding:"))
-        {
-            let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 29\r\nConnection: close\r\n\r\nUnsupported Transfer-Encoding";
+    // Validate header field lines and extract Content-Length & Transfer-Encoding per RFC 9112 §5.1
+    let mut cl_value: Option<usize> = None;
+    let mut has_unsupported_te = false;
+
+    for line in header_lines {
+        let trimmed_line = line.trim_end_matches('\r');
+        if trimmed_line.is_empty() {
+            continue;
+        }
+
+        // RFC 9112 Section 5.1: No whitespace is allowed between the field-name and colon
+        let Some((field_name, field_val)) = trimmed_line.split_once(':') else {
+            let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 26\r\nConnection: close\r\n\r\nInvalid Header Field Line";
+            let _ = timeout(WRITE_TIMEOUT, stream.write_all(resp)).await;
+            return Ok(());
+        };
+
+        if field_name.bytes().any(|b| b == b' ' || b == b'\t') {
+            let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 28\r\nConnection: close\r\n\r\nInvalid Header Field Syntax";
             let _ = timeout(WRITE_TIMEOUT, stream.write_all(resp)).await;
             return Ok(());
         }
 
-        // 2. Framing checks: duplicate or invalid Content-Length
-        let cl_headers: Vec<&str> = header_str
-            .lines()
-            .filter(|l| l.to_lowercase().starts_with("content-length:"))
-            .collect();
-        if cl_headers.len() > 1 {
-            let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 24\r\nConnection: close\r\n\r\nDuplicate Content-Length";
-            let _ = timeout(WRITE_TIMEOUT, stream.write_all(resp)).await;
-            return Ok(());
-        }
+        let name_lower = field_name.to_lowercase();
+        let val_trimmed = field_val.trim_matches([' ', '\t']);
 
-        let content_length = if cl_headers.len() == 1 {
-            let cl_val = cl_headers[0]
-                .split_once(':')
-                .map(|(_, v)| v.trim())
-                .unwrap_or("");
-            if cl_val.is_empty() || !cl_val.bytes().all(|b| b.is_ascii_digit()) {
+        if name_lower == "transfer-encoding" {
+            has_unsupported_te = true;
+        } else if name_lower == "content-length" {
+            if cl_value.is_some() {
+                let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 24\r\nConnection: close\r\n\r\nDuplicate Content-Length";
+                let _ = timeout(WRITE_TIMEOUT, stream.write_all(resp)).await;
+                return Ok(());
+            }
+            if val_trimmed.is_empty() || !val_trimmed.bytes().all(|b| b.is_ascii_digit()) {
                 let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 22\r\nConnection: close\r\n\r\nInvalid Content-Length";
                 let _ = timeout(WRITE_TIMEOUT, stream.write_all(resp)).await;
                 return Ok(());
             }
-            match cl_val.parse::<usize>() {
-                Ok(len) => len,
+            match val_trimmed.parse::<usize>() {
+                Ok(len) => cl_value = Some(len),
                 Err(_) => {
                     let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 22\r\nConnection: close\r\n\r\nInvalid Content-Length";
                     let _ = timeout(WRITE_TIMEOUT, stream.write_all(resp)).await;
                     return Ok(());
                 }
             }
-        } else {
-            0
-        };
+        }
+    }
+
+    // Read POST/DELETE body if applicable
+    let mut body_bytes = Vec::new();
+    if method == "POST" || method == "DELETE" {
+        if has_unsupported_te {
+            let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 29\r\nConnection: close\r\n\r\nUnsupported Transfer-Encoding";
+            let _ = timeout(WRITE_TIMEOUT, stream.write_all(resp)).await;
+            return Ok(());
+        }
+
+        let content_length = cl_value.unwrap_or(0);
 
         if content_length > MAX_BODY_SIZE {
             let resp = b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 17\r\nConnection: close\r\n\r\nPayload Too Large";
@@ -1221,6 +1242,61 @@ mod tests {
         client.read_to_string(&mut resp).await.unwrap();
         assert!(resp.starts_with("HTTP/1.1 200 OK"));
         assert!(resp.contains("fragmented"));
+
+        // 8b. Test whitespace before colon in Content-Length (RFC 9112 §5.1) rejected
+        let mut client = TcpStream::connect(&addr).await.unwrap();
+        let req = "DELETE /api/categories?id=ai_compute HTTP/1.1\r\nHost: localhost\r\nContent-Length : 0:garbage\r\n\r\n";
+        client.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.contains("400 Bad Request"));
+        assert!(resp.contains("Invalid Header Field Syntax"));
+
+        // 8c. Test plus sign in Content-Length rejected
+        let mut client = TcpStream::connect(&addr).await.unwrap();
+        let req = "DELETE /api/categories?id=ai_compute HTTP/1.1\r\nHost: localhost\r\nContent-Length: +0\r\n\r\n";
+        client.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.contains("400 Bad Request"));
+        assert!(resp.contains("Invalid Content-Length"));
+
+        // 9a. Test whitespace before colon in Transfer-Encoding rejected
+        let mut client = TcpStream::connect(&addr).await.unwrap();
+        let req = "DELETE /api/categories?id=ai_compute HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding : chunked\r\n\r\n";
+        client.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.contains("400 Bad Request"));
+        assert!(resp.contains("Invalid Header Field Syntax"));
+
+        // 11. Test 8190-byte headers with body coalesced in single read succeeds
+        let mut client = TcpStream::connect(&addr).await.unwrap();
+        let body = r#"{"id":"coalesced","label":"Coalesced","description":"Valid"}"#;
+        let prefix = format!(
+            "POST /api/categories HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\nX-Pad: ",
+            body.len()
+        );
+        let pad_len = 8190usize.saturating_sub(prefix.len() + 4);
+        let header_str = format!("{}{}\r\n\r\n", prefix, "a".repeat(pad_len));
+        assert_eq!(header_str.len(), 8190);
+        let mut full_req = header_str.into_bytes();
+        full_req.extend_from_slice(body.as_bytes());
+        client.write_all(&full_req).await.unwrap();
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"));
+        assert!(resp.contains("coalesced"));
+
+        // Verify ai_compute was never deleted by any of the 8b, 8c, 9a malformed requests
+        let mut client = TcpStream::connect(&addr).await.unwrap();
+        client
+            .write_all(b"GET /api/categories HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.contains("ai_compute"));
 
         shutdown_tx.send(true).unwrap();
         let _ = server_handle.await;

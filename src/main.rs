@@ -385,11 +385,22 @@ async fn run_daemon(
         Some(config.jev.timeout_seconds),
     )?);
 
-    let notifier = Notifier::new_with_fallback(
+    let notifier = Arc::new(Notifier::new_with_fallback(
         config.alerting.telegram.clone(),
         config.jev.egress_proxy.as_deref(),
-    );
+    ));
     let self_healing = SelfHealingManager::new(config.self_healing.clone());
+
+    // Bounded background alert queue: decouples Telegram delivery from daemon polling cycles
+    let (alert_tx, mut alert_rx) = tokio::sync::mpsc::channel::<AlertEvent>(128);
+    let notifier_worker = Arc::clone(&notifier);
+    tokio::spawn(async move {
+        while let Some(event) = alert_rx.recv().await {
+            if let Err(e) = notifier_worker.dispatch_alert_event(&event).await {
+                error!("Background alert dispatch error: {}", e);
+            }
+        }
+    });
 
     // Optional web dashboard state channels
     let mut dashboard_history =
@@ -441,7 +452,7 @@ async fn run_daemon(
                     });
                 }
 
-                // 2. Autonomous local alerts dispatched based on raw observations
+                // 2. Autonomous local alerts queued to background worker based on raw observations
                 for target in &snapshot.targets {
                     if target.status != TargetStatus::Online {
                         let (sev, reason, title, msg) = match target.status {
@@ -455,15 +466,18 @@ async fn run_daemon(
                                 ),
                             ),
                             TargetStatus::Unreachable => {
-                                let err_text = target.error_message.as_deref().unwrap_or("недоступен");
-                                if err_text.contains("Unexpected HTTP status") {
+                                // Structural classification using target_type and metric fields rather than error text
+                                let status_code = target.metrics.get("status_code").and_then(|v| v.as_u64());
+                                if target.target_type == "http_probe" && status_code.is_some_and(|c| c >= 400) {
                                     (
                                         AlertSeverity::Warning,
                                         AlertReason::ServiceCheckFailed,
                                         "Service Check Failed",
                                         format!(
-                                            "Проверка сервиса '{}' зафиксировала ошибку: {}",
-                                            target.target_name, err_text
+                                            "Проверка HTTP-сервиса '{}' вернула статус {}: {}",
+                                            target.target_name,
+                                            status_code.unwrap_or(0),
+                                            target.error_message.as_deref().unwrap_or("ошибка статуса")
                                         ),
                                     )
                                 } else {
@@ -473,7 +487,9 @@ async fn run_daemon(
                                         "Observation Unavailable",
                                         format!(
                                             "Не удалось проверить цель '{}' ({}): {}",
-                                            target.target_name, target.target_type, err_text
+                                            target.target_name,
+                                            target.target_type,
+                                            target.error_message.as_deref().unwrap_or("недоступен")
                                         ),
                                     )
                                 }
@@ -512,8 +528,8 @@ async fn run_daemon(
                             message: msg,
                             timestamp: chrono::Utc::now(),
                         };
-                        if let Err(e) = notifier.dispatch_alert_event(&event).await {
-                            error!("Local alert dispatch error for '{}': {}", target.target_name, e);
+                        if let Err(e) = alert_tx.try_send(event) {
+                            error!("Alert queue full or closed, dropping event for '{}': {}", target.target_name, e);
                         }
                     } else {
                         // Clear cooldown on recovery so future issues immediately alert
@@ -544,8 +560,29 @@ async fn run_daemon(
                         // Reset advisor cooldown upon successful recovery
                         notifier.clear_advisor_cooldown();
 
-                        if let Err(e) = notifier.dispatch_decision(&decision, &snapshot).await {
-                            error!("Notifier error: {}", e);
+                        // Route routine Jev alert through background queue with deduplication
+                        if decision.is_warning() || decision.is_critical() {
+                            let event = AlertEvent {
+                                source: AlertSource::JevAdvisor,
+                                target_id: None,
+                                severity: if decision.is_critical() {
+                                    AlertSeverity::Critical
+                                } else {
+                                    AlertSeverity::Warning
+                                },
+                                reason_code: AlertReason::RiskElevated,
+                                title: format!("Jev System 1: {}", decision.system_health.to_uppercase()),
+                                message: format!(
+                                    "Оценка риска: {:.2} / 1.00. Рекомендация: {}. Уверенность: {:.0}%",
+                                    decision.risk_score,
+                                    decision.suggested_action,
+                                    decision.health_confidence.unwrap_or(0.0) * 100.0
+                                ),
+                                timestamp: chrono::Utc::now(),
+                            };
+                            if let Err(e) = alert_tx.try_send(event) {
+                                error!("Alert queue full or closed for Jev alert: {}", e);
+                            }
                         }
 
                         if let Err(e) = self_healing.evaluate_and_heal(&decision).await {
@@ -575,7 +612,9 @@ async fn run_daemon(
                             ),
                             timestamp: chrono::Utc::now(),
                         };
-                        let _ = notifier.dispatch_alert_event(&event).await;
+                        if let Err(err) = alert_tx.try_send(event) {
+                            error!("Alert queue full or closed for advisor failure: {}", err);
+                        }
                     }
                 }
             }
