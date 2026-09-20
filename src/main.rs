@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use colored::*;
-use jev_sentinel::actions::{Notifier, SelfHealingManager};
+use jev_sentinel::actions::{
+    AlertEvent, AlertReason, AlertSeverity, AlertSource, Notifier, SelfHealingManager,
+};
 use jev_sentinel::collectors::collect_all;
 use jev_sentinel::config::SentinelConfig;
 use jev_sentinel::core::models::TargetStatus;
@@ -426,6 +428,64 @@ async fn run_daemon(
                 let snapshot = collect_all(&config.targets, config.daemon.concurrency).await;
                 let collect_latency_ms = t_collect.elapsed().as_secs_f64() * 1000.0;
 
+                // 1. Autonomous local alerts dispatched immediately based on raw observations
+                for target in &snapshot.targets {
+                    if target.status != TargetStatus::Online {
+                        let (sev, reason, title, msg) = match target.status {
+                            TargetStatus::Timeout | TargetStatus::Unreachable => (
+                                AlertSeverity::Warning,
+                                AlertReason::ObservationUnavailable,
+                                "Observation Unavailable",
+                                format!(
+                                    "Не удалось проверить цель '{}' ({}): {}",
+                                    target.target_name,
+                                    target.target_type,
+                                    target.error_message.as_deref().unwrap_or("таймаут/недоступен")
+                                ),
+                            ),
+                            TargetStatus::Degraded => (
+                                AlertSeverity::Warning,
+                                AlertReason::ServiceDegraded,
+                                "Service Degraded",
+                                format!(
+                                    "Проверка сервиса '{}' зафиксировала деградацию: {}",
+                                    target.target_name,
+                                    target.error_message.as_deref().unwrap_or("ошибка проверки")
+                                ),
+                            ),
+                            TargetStatus::Unknown => (
+                                AlertSeverity::Warning,
+                                AlertReason::ObservationUnavailable,
+                                "Observation Inconclusive",
+                                format!(
+                                    "Не удалось получить валидные данные от цели '{}': {}",
+                                    target.target_name,
+                                    target
+                                        .error_message
+                                        .as_deref()
+                                        .unwrap_or("некорректный формат ответа")
+                                ),
+                            ),
+                            TargetStatus::Online => unreachable!(),
+                        };
+                        let event = AlertEvent {
+                            source: AlertSource::LocalRule,
+                            target_id: Some(target.target_name.clone()),
+                            severity: sev,
+                            reason_code: reason,
+                            title: title.to_string(),
+                            message: msg,
+                            timestamp: chrono::Utc::now(),
+                        };
+                        if let Err(e) = notifier.dispatch_alert_event(&event).await {
+                            error!("Local alert dispatch error for '{}': {}", target.target_name, e);
+                        }
+                    } else {
+                        // Clear cooldown on recovery so future issues immediately alert
+                        notifier.clear_alert_cooldown(&target.target_name);
+                    }
+                }
+
                 if config.web.enabled {
                     let mut next = dashboard_history.observe(cycle_id, &snapshot, collect_latency_ms);
                     status_tx.send_modify(|current| {
@@ -475,6 +535,21 @@ async fn run_daemon(
                                 next.view_revision = next.view_revision.parse::<u64>().unwrap_or(0).saturating_add(1).to_string();
                             });
                         }
+
+                        // Informational alert on Jev failure (deduplicated by reason_code: AdvisorUnavailable)
+                        let event = AlertEvent {
+                            source: AlertSource::LocalRule,
+                            target_id: None,
+                            severity: AlertSeverity::Warning,
+                            reason_code: AlertReason::AdvisorUnavailable,
+                            title: "AI Advisor Unavailable".to_string(),
+                            message: format!(
+                                "AI-рекомендации временно недоступны: {}. Локальный мониторинг активен.",
+                                e
+                            ),
+                            timestamp: chrono::Utc::now(),
+                        };
+                        let _ = notifier.dispatch_alert_event(&event).await;
                     }
                 }
             }

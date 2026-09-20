@@ -74,11 +74,38 @@ async fn valid_zero_score_survives_http_without_fabricated_confidence() {
 }
 
 #[tokio::test]
+async fn raw_score_normalizes_to_unit_risk() {
+    // 3 criteria (Nominal, Moderate, Critical) -> raw scale is [0.0, 2.0]
+    // Raw 1.6 / (3 - 1) = 0.8 normalized risk
+    let result = evaluate(
+        r#"{"model":"test","answers":{"system_health":{"type":"choice","choice":"degraded"},"risk_score":{"type":"score","score":1.6},"action_required":{"type":"noul","noul":0},"suggested_action":{"type":"choice","choice":"none"}}}"#,
+        200,
+    )
+    .await
+    .unwrap();
+    assert!((result.risk_score - 0.8).abs() < 1e-6);
+    assert_eq!(result.system_health, "degraded");
+
+    // Raw 2.0 / 2.0 = 1.0 (Critical max)
+    let result_max = evaluate(
+        r#"{"model":"test","answers":{"system_health":{"type":"choice","choice":"critical"},"risk_score":{"type":"score","score":2.0},"action_required":{"type":"noul","noul":1.0},"suggested_action":{"type":"choice","choice":"alert_operator"}}}"#,
+        200,
+    )
+    .await
+    .unwrap();
+    assert!((result_max.risk_score - 1.0).abs() < 1e-6);
+}
+
+#[tokio::test]
 async fn incomplete_or_wrong_type_http_responses_are_invalid_not_healthy() {
     for response in [
         r#"{"model":"test","answers":{}}"#,
         r#"{"model":"test","answers":{"system_health":{"type":"choice","choice":"healthy"},"action_required":{"type":"noul","noul":0},"suggested_action":{"type":"choice","choice":"none"}}}"#,
         r#"{"model":"test","answers":{"risk_score":{"type":"score","score":"0.1"}}}"#,
+        // Out of scale for 3 criteria: 2.01 > max (2.0)
+        r#"{"model":"test","answers":{"system_health":{"type":"choice","choice":"healthy"},"risk_score":{"type":"score","score":2.01},"action_required":{"type":"noul","noul":0},"suggested_action":{"type":"choice","choice":"none"}}}"#,
+        // Negative score
+        r#"{"model":"test","answers":{"system_health":{"type":"choice","choice":"healthy"},"risk_score":{"type":"score","score":-0.05},"action_required":{"type":"noul","noul":0},"suggested_action":{"type":"choice","choice":"none"}}}"#,
         "not-json",
     ] {
         assert!(matches!(

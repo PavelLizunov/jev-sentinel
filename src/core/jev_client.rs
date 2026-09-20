@@ -83,11 +83,11 @@ impl JevClient {
             },
         );
 
-        // 2. Risk Score (0.0 .. 1.0)
+        // 2. Risk Score (Scale [0.0 .. 2.0] across 3 criteria, normalized to [0.0 .. 1.0])
         questions.insert(
             "risk_score".to_string(),
             QuestionSpec::Score {
-                instructions: "Rate the immediate operational risk level of system failure, kernel panic, or outage from 0.0 (safe) to 1.0 (imminent failure).".to_string(),
+                instructions: "Rate the immediate operational risk level of system failure, kernel panic, or outage across the criteria scale (0 = Nominal, 1 = Moderate, 2 = Critical).".to_string(),
                 criteria: vec![
                     "Nominal - System running safely within parameters".to_string(),
                     "Moderate - Elevated memory, swap growth, or latency detected".to_string(),
@@ -171,7 +171,7 @@ impl JevClient {
             SentinelError::InvalidJevResponse("invalid JSON or answer schema".into())
         })?;
         validate_answers(&jev_resp, &request_payload.questions)?;
-        decode_decision(jev_resp)
+        decode_decision(jev_resp, &request_payload.questions)
     }
 
     pub fn api_key(&self) -> &str {

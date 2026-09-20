@@ -33,6 +33,7 @@ const MAX_HEADER_SIZE: usize = 8192; // 8 KiB
 const MAX_BODY_SIZE: usize = 8192; // 8 KiB
 const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
@@ -223,12 +224,43 @@ async fn handle_connection(
     // Read POST/DELETE body if applicable
     let mut body_bytes = Vec::new();
     if method == "POST" || method == "DELETE" {
-        let content_length = header_str
+        // 1. Framing checks: reject unsupported Transfer-Encoding
+        if header_str
             .lines()
-            .find(|l| l.to_lowercase().starts_with("content-length:"))
-            .and_then(|l| l.split(':').nth(1))
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(0);
+            .any(|l| l.to_lowercase().starts_with("transfer-encoding:"))
+        {
+            let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 29\r\nConnection: close\r\n\r\nUnsupported Transfer-Encoding";
+            let _ = timeout(WRITE_TIMEOUT, stream.write_all(resp)).await;
+            return Ok(());
+        }
+
+        // 2. Framing checks: duplicate or invalid Content-Length
+        let cl_headers: Vec<&str> = header_str
+            .lines()
+            .filter(|l| l.to_lowercase().starts_with("content-length:"))
+            .collect();
+        if cl_headers.len() > 1 {
+            let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 24\r\nConnection: close\r\n\r\nDuplicate Content-Length";
+            let _ = timeout(WRITE_TIMEOUT, stream.write_all(resp)).await;
+            return Ok(());
+        }
+
+        let content_length = if cl_headers.len() == 1 {
+            match cl_headers[0]
+                .split(':')
+                .nth(1)
+                .and_then(|v| v.trim().parse::<usize>().ok())
+            {
+                Some(len) => len,
+                None => {
+                    let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 22\r\nConnection: close\r\n\r\nInvalid Content-Length";
+                    let _ = timeout(WRITE_TIMEOUT, stream.write_all(resp)).await;
+                    return Ok(());
+                }
+            }
+        } else {
+            0
+        };
 
         if content_length > MAX_BODY_SIZE {
             let resp = b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 17\r\nConnection: close\r\n\r\nPayload Too Large";
@@ -236,19 +268,41 @@ async fn handle_connection(
             return Ok(());
         }
 
+        // Bound leftover bytes strictly to content_length
         if let Some(pos) = header_end_pos {
             let leftover = &buf[pos + 4..];
-            body_bytes.extend_from_slice(leftover);
+            let take_len = leftover.len().min(content_length);
+            body_bytes.extend_from_slice(&leftover[..take_len]);
         }
 
-        while body_bytes.len() < content_length {
-            let remaining = content_length - body_bytes.len();
-            let mut read_chunk = vec![0u8; remaining.min(1024)];
-            let n = stream.read(&mut read_chunk).await?;
-            if n == 0 {
-                break;
+        // Read remaining body within dedicated BODY_READ_TIMEOUT
+        if body_bytes.len() < content_length {
+            let read_res = timeout(BODY_READ_TIMEOUT, async {
+                while body_bytes.len() < content_length {
+                    let remaining = content_length - body_bytes.len();
+                    let mut read_chunk = vec![0u8; remaining.min(1024)];
+                    let n = stream.read(&mut read_chunk).await?;
+                    if n == 0 {
+                        break; // Premature EOF
+                    }
+                    body_bytes.extend_from_slice(&read_chunk[..n]);
+                }
+                Ok::<(), std::io::Error>(())
+            })
+            .await;
+
+            if read_res.is_err() {
+                let resp = b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 15\r\nConnection: close\r\n\r\nRequest Timeout";
+                let _ = timeout(WRITE_TIMEOUT, stream.write_all(resp)).await;
+                return Ok(());
             }
-            body_bytes.extend_from_slice(&read_chunk[..n]);
+        }
+
+        // Verify body completeness before router
+        if body_bytes.len() != content_length {
+            let resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 15\r\nConnection: close\r\n\r\nIncomplete Body";
+            let _ = timeout(WRITE_TIMEOUT, stream.write_all(resp)).await;
+            return Ok(());
         }
     }
 
@@ -1086,6 +1140,52 @@ mod tests {
         let body = resp.split_once("\r\n\r\n").unwrap().1;
         let err_obj: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(err_obj["error_code"], "invalid_json");
+
+        // 7. Test incomplete body (premature EOF) rejects without mutating state
+        let mut client = TcpStream::connect(&addr).await.unwrap();
+        let req = "POST /api/categories HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\nContent-Type: application/json\r\n\r\n{\"id\":\"incomplete\"";
+        client.write_all(req.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap(); // simulate premature EOF
+        let mut resp = String::new();
+        let _ = client.read_to_string(&mut resp).await;
+        assert!(resp.contains("400 Bad Request"));
+        assert!(resp.contains("Incomplete Body"));
+
+        // 8. Test duplicate Content-Length rejected
+        let mut client = TcpStream::connect(&addr).await.unwrap();
+        let req = "POST /api/categories HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\nContent-Length: 10\r\nContent-Type: application/json\r\n\r\n{}";
+        client.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.contains("400 Bad Request"));
+        assert!(resp.contains("Duplicate Content-Length"));
+
+        // 9. Test unsupported Transfer-Encoding rejected
+        let mut client = TcpStream::connect(&addr).await.unwrap();
+        let req = "POST /api/categories HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n0\r\n\r\n";
+        client.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.contains("400 Bad Request"));
+        assert!(resp.contains("Unsupported Transfer-Encoding"));
+
+        // 10. Test fragmented TCP delivery (1 byte chunks) succeeds
+        let mut client = TcpStream::connect(&addr).await.unwrap();
+        let fragment_payload =
+            r#"{"id":"fragmented","label":"Fragmented","description":"Byte by byte"}"#;
+        let req = format!(
+            "POST /api/categories HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+            fragment_payload.len(),
+            fragment_payload
+        );
+        for byte in req.as_bytes() {
+            client.write_all(&[*byte]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"));
+        assert!(resp.contains("fragmented"));
 
         shutdown_tx.send(true).unwrap();
         let _ = server_handle.await;

@@ -3,6 +3,8 @@ use crate::core::models::{InfrastructureSnapshot, SentinelDecision, TargetStatus
 use crate::error::{Result, SentinelError};
 use reqwest::{Client, Proxy};
 use serde_json::json;
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{debug, error, info};
 
@@ -14,9 +16,68 @@ pub fn escape_html(input: &str) -> String {
         .replace('"', "&quot;")
 }
 
+pub fn truncate_field(input: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let char_count = input.chars().count();
+    if char_count <= max_chars {
+        return input.to_string();
+    }
+    let budget = max_chars.saturating_sub(1);
+    let prefix: String = input.chars().take(budget).collect();
+    format!("{prefix}…")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertSource {
+    LocalRule,
+    JevAdvisor,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertSeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertReason {
+    ObservationUnavailable,
+    ServiceCheckFailed,
+    ServiceDegraded,
+    AdvisorUnavailable,
+    RiskElevated,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlertEvent {
+    pub source: AlertSource,
+    pub target_id: Option<String>,
+    pub severity: AlertSeverity,
+    pub reason_code: AlertReason,
+    pub title: String,
+    pub message: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DeduplicationKey {
+    pub source: AlertSource,
+    pub target_id: Option<String>,
+    pub reason_code: AlertReason,
+}
+
 pub struct Notifier {
     client: Client,
     telegram: Option<TelegramAlertSettings>,
+    delivered_events: Mutex<HashMap<DeduplicationKey, (AlertSeverity, std::time::Instant)>>,
 }
 
 impl Notifier {
@@ -62,11 +123,92 @@ impl Notifier {
             Client::new()
         };
 
-        Self { client, telegram }
+        Self {
+            client,
+            telegram,
+            delivered_events: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn is_configured(&self) -> bool {
         self.telegram.is_some()
+    }
+
+    pub async fn dispatch_alert_event(&self, event: &AlertEvent) -> Result<bool> {
+        let Some(tg) = &self.telegram else {
+            return Ok(false);
+        };
+
+        let min_sev = tg.min_severity.to_lowercase();
+        let should_alert = match min_sev.as_str() {
+            "info" => true,
+            "warning" => event.severity >= AlertSeverity::Warning,
+            "critical" => event.severity >= AlertSeverity::Critical,
+            _ => event.severity >= AlertSeverity::Warning,
+        };
+
+        if !should_alert {
+            return Ok(false);
+        }
+
+        let key = DeduplicationKey {
+            source: event.source,
+            target_id: event.target_id.clone(),
+            reason_code: event.reason_code,
+        };
+
+        // Check deduplication: suppress if same or lower severity within 300s cooldown
+        {
+            let delivered = self.delivered_events.lock().unwrap();
+            if let Some((prev_sev, sent_at)) = delivered.get(&key) {
+                if event.severity <= *prev_sev && sent_at.elapsed() < Duration::from_secs(300) {
+                    debug!("Suppressed duplicate alert for {:?}", key);
+                    return Ok(false);
+                }
+            }
+        }
+
+        let formatted = self.format_alert_event(event);
+        self.send_raw_message(&formatted).await?;
+
+        // Record delivery only after Telegram confirms success
+        {
+            let mut delivered = self.delivered_events.lock().unwrap();
+            delivered.insert(key, (event.severity, std::time::Instant::now()));
+        }
+
+        Ok(true)
+    }
+
+    pub fn clear_alert_cooldown(&self, target_id: &str) {
+        if let Ok(mut delivered) = self.delivered_events.lock() {
+            delivered.retain(|k, _| k.target_id.as_deref() != Some(target_id));
+        }
+    }
+
+    pub fn format_alert_event(&self, event: &AlertEvent) -> String {
+        let icon = match event.severity {
+            AlertSeverity::Info => "ℹ️",
+            AlertSeverity::Warning => "⚠️",
+            AlertSeverity::Critical => "🚨",
+        };
+        let safe_title = escape_html(&truncate_field(&event.title, 80));
+        let mut lines = vec![format!("<b>{} Jev Sentinel: {}</b>", icon, safe_title)];
+        if let Some(ref target) = event.target_id {
+            lines.push(format!(
+                "<b>Target:</b> <code>{}</code>",
+                escape_html(&truncate_field(target, 80))
+            ));
+        }
+        lines.push(format!("<b>Severity:</b> {:?}", event.severity));
+        lines.push(format!("<b>Reason:</b> {:?}", event.reason_code));
+        lines.push(format!(
+            "<b>Timestamp:</b> {}",
+            event.timestamp.to_rfc3339()
+        ));
+        lines.push("".to_string());
+        lines.push(escape_html(&truncate_field(&event.message, 1000)));
+        lines.join("\n")
     }
 
     pub async fn dispatch_decision(
@@ -187,11 +329,7 @@ impl Notifier {
                 target.latency_ms
             ));
             if let Some(err) = &target.error_message {
-                let truncated_err = if err.len() > 200 {
-                    format!("{}...", &err[..197])
-                } else {
-                    err.clone()
-                };
+                let truncated_err = truncate_field(err, 180);
                 lines.push(format!(
                     "  <i>Error:</i> <code>{}</code>",
                     escape_html(&truncated_err)
@@ -207,36 +345,78 @@ impl Notifier {
             return Ok(());
         };
 
-        let safe_text = if message_text.len() > 4000 {
-            format!("{}...\n<i>(message truncated)</i>", &message_text[..3950])
-        } else {
-            message_text.to_string()
-        };
-
         let tg_url = format!("https://api.telegram.org/bot{}/sendMessage", tg.bot_token);
-        let body = json!({
-            "chat_id": tg.chat_id,
-            "text": safe_text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": true
-        });
 
-        let resp = self
-            .client
-            .post(&tg_url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                SentinelError::Action(format!("Network error sending Telegram message: {}", e))
-            })?;
+        // Group lines into chunks bounded to 3900 characters without splitting HTML tags
+        let mut chunks = Vec::new();
+        let mut current_chunk = String::new();
+        for line in message_text.lines() {
+            if current_chunk.chars().count() + line.chars().count() + 1 > 3900
+                && !current_chunk.is_empty()
+            {
+                chunks.push(current_chunk);
+                current_chunk = String::new();
+            }
+            if !current_chunk.is_empty() {
+                current_chunk.push('\n');
+            }
+            current_chunk.push_str(line);
+        }
+        if !current_chunk.is_empty() {
+            chunks.push(current_chunk);
+        }
 
-        let status = resp.status();
-        if !status.is_success() {
-            let err_body = resp.text().await.unwrap_or_default();
-            let desc = format!("Telegram API HTTP {}: {}", status, err_body);
-            error!("{}", desc);
-            return Err(SentinelError::Action(desc));
+        for chunk in chunks {
+            let body = json!({
+                "chat_id": tg.chat_id,
+                "text": chunk,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": true
+            });
+
+            let resp = self
+                .client
+                .post(&tg_url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| {
+                    SentinelError::Action(format!("Network error sending Telegram message: {}", e))
+                })?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                let err_text = resp.text().await.unwrap_or_default();
+                // Fallback to plain-text send if HTML entity parsing fails
+                if status.as_u16() == 400 {
+                    let fallback_body = json!({
+                        "chat_id": tg.chat_id,
+                        "text": truncate_field(&chunk, 4096),
+                        "disable_web_page_preview": true
+                    });
+                    if let Ok(fb_resp) = self.client.post(&tg_url).json(&fallback_body).send().await
+                    {
+                        if fb_resp.status().is_success() {
+                            continue;
+                        }
+                    }
+                }
+                let desc = format!("Telegram API HTTP {}: {}", status, err_text);
+                error!("{}", desc);
+                return Err(SentinelError::Action(desc));
+            }
+
+            let resp_json: serde_json::Value = resp.json().await.unwrap_or_default();
+            if resp_json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                let desc = resp_json
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown Telegram API rejection");
+                return Err(SentinelError::Action(format!(
+                    "Telegram API error: {}",
+                    desc
+                )));
+            }
         }
 
         info!("Dispatched Telegram notification to chat '{}'", tg.chat_id);
@@ -281,5 +461,49 @@ mod tests {
         let msg = notifier.format_decision_message(&decision, &snapshot);
         assert!(msg.contains("⚠️ Jev Sentinel Alert: DEGRADED"));
         assert!(msg.contains("restart_unhealthy_service"));
+    }
+
+    #[test]
+    fn test_truncate_field_boundary_cases() {
+        assert_eq!(truncate_field("текст", 0), "");
+        assert_eq!(truncate_field("текст", 1), "…");
+        assert_eq!(truncate_field("", 0), "");
+        assert_eq!(truncate_field("я", 1), "я");
+        assert_eq!(truncate_field("длинный русский текст", 10), "длинный р…");
+        assert!(truncate_field("длинный русский текст", 10).chars().count() <= 10);
+    }
+
+    #[test]
+    fn test_truncate_field_cyrillic_and_emojis() {
+        // String of 300 Cyrillic characters with emojis
+        let long_error =
+            "🚨 Ошибка подключения к базе данных: сервер перегружен или недоступен! ".repeat(5);
+        let truncated = truncate_field(&long_error, 180);
+        assert!(truncated.chars().count() <= 180);
+        assert!(truncated.ends_with('…'));
+        // Verify HTML escaping on truncated text works without panic or entity split
+        let escaped = escape_html(&truncated);
+        assert!(!escaped.contains('<'));
+        assert!(!escaped.contains('>'));
+    }
+
+    #[test]
+    fn test_format_alert_event_clean_blocks() {
+        let notifier = Notifier::new(None);
+        let event = AlertEvent {
+            source: AlertSource::LocalRule,
+            target_id: Some("worker <prod> & node".to_string()),
+            severity: AlertSeverity::Warning,
+            reason_code: AlertReason::ObservationUnavailable,
+            title: "Observation <Unavailable>".to_string(),
+            message: "Не удалось проверить цель: таймаут > 5000ms & отказ соединения".to_string(),
+            timestamp: chrono::Utc::now(),
+        };
+
+        let formatted = notifier.format_alert_event(&event);
+        assert!(formatted.contains("Observation &lt;Unavailable&gt;"));
+        assert!(formatted.contains("worker &lt;prod&gt; &amp; node"));
+        assert!(formatted.contains("&gt; 5000ms &amp; отказ"));
+        assert!(!formatted.contains('<') || formatted.contains("<b>")); // only valid tags
     }
 }
