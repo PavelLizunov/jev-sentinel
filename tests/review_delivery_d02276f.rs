@@ -169,3 +169,22 @@ async fn admission_reports_closed_after_idle_worker_has_terminated() {
         "admission must not claim acceptance into a stopped sender"
     );
 }
+
+#[tokio::test]
+async fn content_change_resets_chunk_progress_while_identical_plan_resumes() {
+    let n = notifier();
+    let old_plan = local(&n, AlertSeverity::Warning, "Plan A", "Message A");
+    assert!(n.enqueue_alert(old_plan.clone()));
+    let _popped = n.pop_next_pending().unwrap();
+
+    // When message text or severity escalates, a new plan is recognized
+    let escalated = local(
+        &n,
+        AlertSeverity::Critical,
+        "Plan B",
+        "Message B (escalated)",
+    );
+    assert!(n.enqueue_alert(escalated));
+    let next = n.pop_next_pending().unwrap();
+    assert_eq!(next.severity, AlertSeverity::Critical);
+}

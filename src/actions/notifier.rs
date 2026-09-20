@@ -86,8 +86,16 @@ pub struct IncidentId {
     pub generation: u64,
 }
 
+fn compute_chunks_hash(chunks: &[String]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    chunks.hash(&mut hasher);
+    hasher.finish()
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GenerationRecord {
+    pub plan_hash: u64,
     pub confirmed_chunks: usize,
     pub attempts: usize,
     pub exhausted: bool,
@@ -361,13 +369,22 @@ impl Notifier {
         };
 
         let mut state = self.delivery_state.lock().unwrap();
+        // Extract pending generations before mutable borrow of incidents
+        let pending_gens: std::collections::HashSet<u64> = state
+            .pending
+            .keys()
+            .filter(|id| id.key == key)
+            .map(|id| id.generation)
+            .collect();
+
         if let Some(inc) = state.incidents.get_mut(&key) {
             let rec = inc.records.entry(event.generation).or_default();
             rec.delivered_cooldown = Some((event.severity, std::time::Instant::now()));
 
-            // Prune old historical records (>600s) to keep memory bounded
+            // Prune old historical records (>600s) to keep memory bounded,
+            // but NEVER prune if there is an active pending event for that generation!
             inc.records.retain(|&gen, r| {
-                if gen == inc.current_generation {
+                if gen == inc.current_generation || pending_gens.contains(&gen) {
                     return true;
                 }
                 if let Some((_, sent_at)) = r.delivered_cooldown {
@@ -612,13 +629,22 @@ impl Notifier {
             generation: event.generation,
         };
 
+        let chunks = self.split_into_chunks(message_text);
+        let current_plan_hash = compute_chunks_hash(&chunks);
+
         let (starting_chunk, is_exhausted) = {
-            let state = self.delivery_state.lock().unwrap();
-            if let Some(inc) = state.incidents.get(&inc_id.key) {
-                if let Some(rec) = inc.records.get(&inc_id.generation) {
-                    (rec.confirmed_chunks, rec.exhausted)
-                } else {
+            let mut state = self.delivery_state.lock().unwrap();
+            if let Some(inc) = state.incidents.get_mut(&inc_id.key) {
+                let rec = inc.records.entry(inc_id.generation).or_default();
+                if rec.exhausted {
+                    (0, true)
+                } else if rec.plan_hash != current_plan_hash {
+                    // New message content / plan version: reset chunk progress to 0!
+                    rec.plan_hash = current_plan_hash;
+                    rec.confirmed_chunks = 0;
                     (0, false)
+                } else {
+                    (rec.confirmed_chunks, false)
                 }
             } else {
                 (0, false)
@@ -635,7 +661,6 @@ impl Notifier {
             ));
         }
 
-        let chunks = self.split_into_chunks(message_text);
         if starting_chunk >= chunks.len() {
             return Ok(());
         }
@@ -664,7 +689,23 @@ impl Notifier {
                     "disable_web_page_preview": true
                 });
 
-                let send_res = self.client.post(&tg_url).json(&body).send().await;
+                let send_future = self.client.post(&tg_url).json(&body).send();
+                tokio::pin!(send_future);
+                let send_res = if let Some(rx) = shutdown_rx {
+                    let mut rx_clone = rx.clone();
+                    tokio::select! {
+                        res = &mut send_future => res,
+                        _ = rx_clone.changed() => {
+                            if *rx_clone.borrow() {
+                                return Err(SentinelError::Action("Interrupted by shutdown during send".into()));
+                            }
+                            send_future.await
+                        }
+                    }
+                } else {
+                    send_future.await
+                };
+
                 let resp = match send_res {
                     Ok(r) => r,
                     Err(e) => {
@@ -694,7 +735,24 @@ impl Notifier {
                         "text": truncate_field(chunk, 4096),
                         "disable_web_page_preview": true
                     });
-                    match self.client.post(&tg_url).json(&fallback_body).send().await {
+                    let fb_future = self.client.post(&tg_url).json(&fallback_body).send();
+                    tokio::pin!(fb_future);
+                    let fb_send_res = if let Some(rx) = shutdown_rx {
+                        let mut rx_clone = rx.clone();
+                        tokio::select! {
+                            res = &mut fb_future => res,
+                            _ = rx_clone.changed() => {
+                                if *rx_clone.borrow() {
+                                    return Err(SentinelError::Action("Interrupted by shutdown during fallback".into()));
+                                }
+                                fb_future.await
+                            }
+                        }
+                    } else {
+                        fb_future.await
+                    };
+
+                    match fb_send_res {
                         Ok(fb_resp) => {
                             let fb_status = fb_resp.status();
                             if fb_status.as_u16() == 429 {

@@ -11,7 +11,7 @@ use jev_sentinel::web::run_web_server;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser)]
@@ -426,7 +426,17 @@ async fn run_daemon(
             _ = tokio::signal::ctrl_c() => {
                 info!("Shutdown signal received, terminating daemon gracefully...");
                 let _ = shutdown_tx.send(true);
-                let _ = tokio::time::timeout(Duration::from_secs(3), worker_handle).await;
+                notifier.close_admission();
+                let mut worker_handle = worker_handle;
+                match tokio::time::timeout(Duration::from_secs(3), &mut worker_handle).await {
+                    Ok(Ok(())) => info!("Alert worker terminated cleanly"),
+                    Ok(Err(join_err)) => error!("Alert worker join error: {}", join_err),
+                    Err(_timeout) => {
+                        warn!("Alert worker did not exit within budget, aborting task");
+                        worker_handle.abort();
+                        let _ = worker_handle.await;
+                    }
+                }
                 break Ok(());
             }
             _ = interval.tick() => {
