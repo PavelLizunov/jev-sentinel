@@ -80,22 +80,30 @@ pub struct DeduplicationKey {
     pub reason_code: AlertReason,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IncidentId {
+    pub key: DeduplicationKey,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct IncidentState {
     pub current_generation: u64,
-    pub delivered_cooldown: Option<(AlertSeverity, std::time::Instant)>,
+    pub delivered_generations: HashMap<u64, (AlertSeverity, std::time::Instant)>,
 }
 
 #[derive(Default)]
 pub struct DeliveryState {
+    pub is_closed: bool,
     pub incidents: HashMap<DeduplicationKey, IncidentState>,
-    pub pending: HashMap<DeduplicationKey, AlertEvent>,
+    pub pending: HashMap<IncidentId, AlertEvent>,
 }
 
 pub struct Notifier {
     client: Client,
     telegram: Option<TelegramAlertSettings>,
     delivery_state: Mutex<DeliveryState>,
+    rate_limit_until: Mutex<Option<std::time::Instant>>,
     notify: tokio::sync::Notify,
 }
 
@@ -146,6 +154,7 @@ impl Notifier {
             client,
             telegram,
             delivery_state: Mutex::new(DeliveryState::default()),
+            rate_limit_until: Mutex::new(None),
             notify: tokio::sync::Notify::new(),
         }
     }
@@ -172,10 +181,7 @@ impl Notifier {
         };
         let generation = {
             let mut state = self.delivery_state.lock().unwrap();
-            let inc = state.incidents.entry(key).or_insert_with(|| IncidentState {
-                current_generation: 0,
-                delivered_cooldown: None,
-            });
+            let inc = state.incidents.entry(key).or_default();
             inc.current_generation
         };
 
@@ -215,15 +221,14 @@ impl Notifier {
         };
 
         let mut state = self.delivery_state.lock().unwrap();
-        let incident = state
-            .incidents
-            .entry(key.clone())
-            .or_insert_with(|| IncidentState {
-                current_generation: event.generation,
-                delivered_cooldown: None,
-            });
+        if state.is_closed {
+            debug!("Rejected alert enqueue: notifier is closed");
+            return false;
+        }
 
-        // Discard obsolete event if target has already recovered/advanced generation
+        let incident = state.incidents.entry(key.clone()).or_default();
+
+        // Discard obsolete event if target has already advanced generation beyond this event
         if event.generation < incident.current_generation {
             debug!(
                 "Discarding obsolete event for {:?} (event gen {}, current gen {})",
@@ -232,16 +237,21 @@ impl Notifier {
             return false;
         }
 
-        // Suppress duplicate if delivered recently with same or higher severity
-        if let Some((prev_sev, sent_at)) = incident.delivered_cooldown {
+        // Suppress duplicate if this exact generation was delivered recently with same or higher severity
+        if let Some(&(prev_sev, sent_at)) = incident.delivered_generations.get(&event.generation) {
             if event.severity <= prev_sev && sent_at.elapsed() < Duration::from_secs(300) {
                 debug!("Suppressed duplicate alert for {:?}", key);
                 return false;
             }
         }
 
-        // Coalesce into bounded pending table (max 64 entries)
-        if let Some(existing) = state.pending.get_mut(&key) {
+        let inc_id = IncidentId {
+            key: key.clone(),
+            generation: event.generation,
+        };
+
+        // Coalesce into bounded pending table within the same incident generation (max 64 entries)
+        if let Some(existing) = state.pending.get_mut(&inc_id) {
             if event.severity > existing.severity {
                 *existing = event; // Escalate severity and message!
             } else if event.severity == existing.severity {
@@ -254,15 +264,15 @@ impl Notifier {
         } else {
             if state.pending.len() >= 64 {
                 // Priority admission: evict lower severity if available
-                if let Some(evict_key) = state
+                if let Some(evict_id) = state
                     .pending
                     .iter()
                     .filter(|(_, e)| e.severity < event.severity)
                     .map(|(k, _)| k.clone())
                     .next()
                 {
-                    state.pending.remove(&evict_key);
-                    state.pending.insert(key, event);
+                    state.pending.remove(&evict_id);
+                    state.pending.insert(inc_id, event);
                 } else {
                     warn!(
                         "Pending alert table full (64), dropping event for {:?}",
@@ -271,7 +281,7 @@ impl Notifier {
                     return false;
                 }
             } else {
-                state.pending.insert(key, event);
+                state.pending.insert(inc_id, event);
             }
         }
 
@@ -282,27 +292,27 @@ impl Notifier {
     pub fn pop_next_pending(&self) -> Option<AlertEvent> {
         let mut state = self.delivery_state.lock().unwrap();
         while !state.pending.is_empty() {
-            let key_to_pop = state
+            let id_to_pop = state
                 .pending
                 .iter()
                 .max_by_key(|(_, e)| e.severity)
                 .map(|(k, _)| k.clone())?;
 
-            let event = state.pending.remove(&key_to_pop)?;
+            let event = state.pending.remove(&id_to_pop)?;
 
-            // Check if this pending event is already covered by a delivery cooldown
-            if let Some(inc) = state.incidents.get(&key_to_pop) {
-                if inc.current_generation == event.generation {
-                    if let Some((delivered_sev, sent_at)) = inc.delivered_cooldown {
-                        if event.severity <= delivered_sev
-                            && sent_at.elapsed() < Duration::from_secs(300)
-                        {
-                            debug!(
-                                "Discarding redundant pending repeat covered by cooldown: {:?}",
-                                key_to_pop
-                            );
-                            continue;
-                        }
+            // Check if this incident generation was already delivered at equal/higher severity
+            if let Some(inc) = state.incidents.get(&id_to_pop.key) {
+                if let Some(&(delivered_sev, sent_at)) =
+                    inc.delivered_generations.get(&event.generation)
+                {
+                    if event.severity <= delivered_sev
+                        && sent_at.elapsed() < Duration::from_secs(300)
+                    {
+                        debug!(
+                            "Discarding redundant pending repeat covered by delivered generation: {:?}",
+                            id_to_pop
+                        );
+                        continue;
                     }
                 }
             }
@@ -321,18 +331,23 @@ impl Notifier {
 
         let mut state = self.delivery_state.lock().unwrap();
         if let Some(inc) = state.incidents.get_mut(&key) {
+            inc.delivered_generations.insert(
+                event.generation,
+                (event.severity, std::time::Instant::now()),
+            );
+
             if inc.current_generation == event.generation {
-                inc.delivered_cooldown = Some((event.severity, std::time::Instant::now()));
                 debug!(
-                    "Committed delivery for {:?} at generation {}",
+                    "Committed delivery for current generation {:?} gen {}",
                     key, event.generation
                 );
                 return true;
             } else {
                 debug!(
-                    "Discarded late Telegram ACK for {:?}: generation changed from {} to {}",
+                    "Committed delivery for historical generation {:?} gen {} (current: {})",
                     key, event.generation, inc.current_generation
                 );
+                return false;
             }
         }
         false
@@ -343,10 +358,8 @@ impl Notifier {
         for (k, inc) in state.incidents.iter_mut() {
             if k.target_id.as_deref() == Some(target_id) {
                 inc.current_generation = inc.current_generation.wrapping_add(1);
-                inc.delivered_cooldown = None;
             }
         }
-        // Do not erase accepted undelivered pending events; they remain as historical alerts
     }
 
     pub fn recover_advisor_unavailable(&self) {
@@ -358,9 +371,7 @@ impl Notifier {
         };
         if let Some(inc) = state.incidents.get_mut(&adv_key) {
             inc.current_generation = inc.current_generation.wrapping_add(1);
-            inc.delivered_cooldown = None;
         }
-        // Do not erase pending
     }
 
     pub fn recover_risk_elevated(&self) {
@@ -372,9 +383,7 @@ impl Notifier {
         };
         if let Some(inc) = state.incidents.get_mut(&risk_key) {
             inc.current_generation = inc.current_generation.wrapping_add(1);
-            inc.delivered_cooldown = None;
         }
-        // Do not erase pending
     }
 
     pub async fn run_worker(
@@ -382,6 +391,9 @@ impl Notifier {
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) {
         loop {
+            if *shutdown_rx.borrow() {
+                break;
+            }
             tokio::select! {
                 _ = self.notify.notified() => {
                     while let Some(event) = self.pop_next_pending() {
@@ -391,6 +403,9 @@ impl Notifier {
                         } else {
                             self.commit_delivery(&event);
                         }
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
                     }
                 }
                 _ = shutdown_rx.changed() => {
@@ -399,6 +414,9 @@ impl Notifier {
                     }
                 }
             }
+        }
+        if let Ok(mut state) = self.delivery_state.lock() {
+            state.is_closed = true;
         }
     }
 
@@ -612,9 +630,22 @@ impl Notifier {
 
         for attempt in 0..3 {
             let mut send_err = None;
-            let mut retry_after_duration = None;
 
             while confirmed_chunks < chunks.len() {
+                // Obey global Telegram rate limit embargo before issuing any HTTP request
+                let embargo = {
+                    let guard = self.rate_limit_until.lock().unwrap();
+                    *guard
+                };
+                if let Some(until) = embargo {
+                    let now = std::time::Instant::now();
+                    if until > now {
+                        let wait = until - now;
+                        debug!("Observing Telegram rate limit embargo, sleeping {:?}", wait);
+                        tokio::time::sleep(wait).await;
+                    }
+                }
+
                 let chunk = &chunks[confirmed_chunks];
                 let body = json!({
                     "chat_id": tg.chat_id,
@@ -638,15 +669,18 @@ impl Notifier {
                 let status = resp.status();
                 if status.as_u16() == 429 {
                     let err_text = resp.text().await.unwrap_or_default();
+                    let mut wait_sec = 5u64;
                     if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&err_text) {
                         if let Some(sec) = err_json
                             .get("parameters")
                             .and_then(|p| p.get("retry_after"))
                             .and_then(|v| v.as_u64())
                         {
-                            retry_after_duration = Some(Duration::from_secs(sec));
+                            wait_sec = sec;
                         }
                     }
+                    *self.rate_limit_until.lock().unwrap() =
+                        Some(std::time::Instant::now() + Duration::from_secs(wait_sec));
                     send_err = Some(SentinelError::Action(format!(
                         "Telegram API HTTP 429: {}",
                         err_text
@@ -661,7 +695,32 @@ impl Notifier {
                         "disable_web_page_preview": true
                     });
                     match self.client.post(&tg_url).json(&fallback_body).send().await {
-                        Ok(fb_resp) => Self::check_telegram_response(fb_resp).await,
+                        Ok(fb_resp) => {
+                            let fb_status = fb_resp.status();
+                            if fb_status.as_u16() == 429 {
+                                let err_text = fb_resp.text().await.unwrap_or_default();
+                                let mut wait_sec = 5u64;
+                                if let Ok(err_json) =
+                                    serde_json::from_str::<serde_json::Value>(&err_text)
+                                {
+                                    if let Some(sec) = err_json
+                                        .get("parameters")
+                                        .and_then(|p| p.get("retry_after"))
+                                        .and_then(|v| v.as_u64())
+                                    {
+                                        wait_sec = sec;
+                                    }
+                                }
+                                *self.rate_limit_until.lock().unwrap() =
+                                    Some(std::time::Instant::now() + Duration::from_secs(wait_sec));
+                                Err(SentinelError::Action(format!(
+                                    "Telegram API fallback HTTP 429: {}",
+                                    err_text
+                                )))
+                            } else {
+                                Self::check_telegram_response(fb_resp).await
+                            }
+                        }
                         Err(e) => Err(SentinelError::Action(format!(
                             "Network error in Telegram fallback: {}",
                             e
@@ -689,8 +748,7 @@ impl Notifier {
 
             last_err = send_err;
             if attempt < 2 {
-                let sleep_duration = retry_after_duration.unwrap_or(Duration::from_millis(250));
-                tokio::time::sleep(sleep_duration).await;
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
         }
 
