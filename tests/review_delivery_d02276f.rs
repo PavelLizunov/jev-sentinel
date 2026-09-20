@@ -642,3 +642,35 @@ async fn transport_rate_limit_429_monotonic_embargo_and_fallback() {
         "Monotonic max must not shorten embargo"
     );
 }
+
+#[tokio::test]
+async fn safety_cap_32_evicts_only_unprotected_historical_generations() {
+    let n = notifier();
+    // Enqueue generation 0 at Warning: keep it in pending while Critical events are popped
+    let g0 = local(&n, AlertSeverity::Warning, "G0", "evidence 0");
+    assert!(n.enqueue_alert(g0.clone()));
+
+    // Create 40 historical generations at Critical that get popped and delivered
+    for i in 1..=40 {
+        n.recover_target("node-a");
+        let ev = local(
+            &n,
+            AlertSeverity::Critical,
+            &format!("G{i}"),
+            &format!("evidence {i}"),
+        );
+        assert!(n.enqueue_alert(ev.clone()));
+        let popped = n.pop_next_pending().unwrap();
+        assert_eq!(popped.generation, i as u64);
+        assert!(n.commit_delivery(&popped));
+    }
+
+    // Trigger pruning via recovery
+    n.recover_target("node-a");
+
+    // Pop the next pending: G0 was preserved in pending and never evicted by the 32 safety cap!
+    let g0_popped = n
+        .pop_next_pending()
+        .expect("G0 must remain protected in pending");
+    assert_eq!(g0_popped.generation, 0, "G0 in pending was preserved");
+}

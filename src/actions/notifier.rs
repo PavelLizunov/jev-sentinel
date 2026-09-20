@@ -100,6 +100,7 @@ fn compute_plan_hash(event: &AlertEvent) -> u64 {
 pub struct GenerationRecord {
     pub plan_hash: u64,
     pub plan_severity: AlertSeverity,
+    pub chunks: Vec<String>,
     pub confirmed_chunks: usize,
     pub attempts: usize,
     pub exhausted: bool,
@@ -112,6 +113,7 @@ impl Default for GenerationRecord {
         Self {
             plan_hash: 0,
             plan_severity: AlertSeverity::Info,
+            chunks: Vec::new(),
             confirmed_chunks: 0,
             attempts: 0,
             exhausted: false,
@@ -128,10 +130,10 @@ pub struct IncidentState {
 }
 
 impl IncidentState {
-    pub fn prune_old_records(&mut self, pending_gens: &std::collections::HashSet<u64>) {
+    pub fn prune_old_records(&mut self, protected_gens: &std::collections::HashSet<u64>) {
         let current_gen = self.current_generation;
         self.records.retain(|&gen, r| {
-            if gen == current_gen || pending_gens.contains(&gen) {
+            if gen == current_gen || protected_gens.contains(&gen) {
                 return true;
             }
             if let Some((_, sent_at)) = r.delivered_cooldown {
@@ -147,17 +149,23 @@ impl IncidentState {
             false
         });
 
-        // Safety cap: retain at most 32 newest generations per incident
-        if self.records.len() > 32 {
-            let mut non_essential: Vec<u64> = self
+        // Safety cap: retain at most 32 non-protected historical generations per incident.
+        // Protected generations (current, pending, in-flight) are NEVER evicted by this cap!
+        let non_protected_count = self
+            .records
+            .keys()
+            .filter(|&g| *g != current_gen && !protected_gens.contains(g))
+            .count();
+        if non_protected_count > 32 {
+            let mut candidates: Vec<u64> = self
                 .records
                 .keys()
                 .copied()
-                .filter(|&g| g != current_gen && !pending_gens.contains(&g))
+                .filter(|&g| g != current_gen && !protected_gens.contains(&g))
                 .collect();
-            non_essential.sort_unstable(); // ascending (oldest first)
-            let excess = self.records.len().saturating_sub(32);
-            for g in non_essential.into_iter().take(excess) {
+            candidates.sort_unstable(); // ascending (oldest first)
+            let excess = non_protected_count - 32;
+            for g in candidates.into_iter().take(excess) {
                 self.records.remove(&g);
             }
         }
@@ -167,24 +175,33 @@ impl IncidentState {
 #[derive(Default)]
 pub struct DeliveryState {
     pub is_closed: bool,
+    pub in_flight: std::collections::HashSet<IncidentId>,
     pub incidents: HashMap<DeduplicationKey, IncidentState>,
     pub pending: HashMap<IncidentId, AlertEvent>,
 }
 
 impl DeliveryState {
     pub fn prune_incident_records(&mut self) {
-        let mut pending_by_key: HashMap<DeduplicationKey, std::collections::HashSet<u64>> =
+        let mut protected_by_key: HashMap<DeduplicationKey, std::collections::HashSet<u64>> =
             HashMap::new();
+        // Protect all generations in pending
         for inc_id in self.pending.keys() {
-            pending_by_key
+            protected_by_key
+                .entry(inc_id.key.clone())
+                .or_default()
+                .insert(inc_id.generation);
+        }
+        // Protect all generations in-flight
+        for inc_id in &self.in_flight {
+            protected_by_key
                 .entry(inc_id.key.clone())
                 .or_default()
                 .insert(inc_id.generation);
         }
         for (key, inc) in self.incidents.iter_mut() {
             let empty_set = std::collections::HashSet::new();
-            let pending_gens = pending_by_key.get(key).unwrap_or(&empty_set);
-            inc.prune_old_records(pending_gens);
+            let protected_gens = protected_by_key.get(key).unwrap_or(&empty_set);
+            inc.prune_old_records(protected_gens);
         }
     }
 }
@@ -488,9 +505,25 @@ impl Notifier {
                 }
             }
 
+            state.in_flight.insert(id_to_pop);
             return Some(event);
         }
         None
+    }
+
+    pub fn release_in_flight(&self, event: &AlertEvent) {
+        let inc_id = IncidentId {
+            key: DeduplicationKey {
+                source: event.source,
+                target_id: event.target_id.clone(),
+                reason_code: event.reason_code,
+            },
+            generation: event.generation,
+        };
+        if let Ok(mut state) = self.delivery_state.lock() {
+            state.in_flight.remove(&inc_id);
+            state.prune_incident_records();
+        }
     }
 
     pub fn commit_delivery(&self, event: &AlertEvent) -> bool {
@@ -499,8 +532,14 @@ impl Notifier {
             target_id: event.target_id.clone(),
             reason_code: event.reason_code,
         };
+        let inc_id = IncidentId {
+            key: key.clone(),
+            generation: event.generation,
+        };
 
         let mut state = self.delivery_state.lock().unwrap();
+        state.in_flight.remove(&inc_id);
+
         let is_current = if let Some(inc) = state.incidents.get_mut(&key) {
             let rec = inc.records.entry(event.generation).or_default();
             rec.delivered_cooldown = Some((event.severity, std::time::Instant::now()));
@@ -576,6 +615,7 @@ impl Notifier {
                         let formatted = self.format_alert_event(&event);
                         if let Err(e) = self.send_alert_message(&event, &formatted, Some(&shutdown_rx)).await {
                             error!("Alert delivery failed after retries for {:?}: {}", event.target_id, e);
+                            self.release_in_flight(&event);
                         } else {
                             self.commit_delivery(&event);
                         }
@@ -638,8 +678,25 @@ impl Notifier {
             return Ok(false);
         }
 
+        let inc_id = IncidentId {
+            key: DeduplicationKey {
+                source: event.source,
+                target_id: event.target_id.clone(),
+                reason_code: event.reason_code,
+            },
+            generation: event.generation,
+        };
+        {
+            let mut state = self.delivery_state.lock().unwrap();
+            state.in_flight.insert(inc_id);
+        }
+
         let formatted = self.format_alert_event(event);
-        self.send_alert_message(event, &formatted, None).await?;
+        let res = self.send_alert_message(event, &formatted, None).await;
+        if res.is_err() {
+            self.release_in_flight(event);
+        }
+        res?;
         Ok(self.commit_delivery(event))
     }
 
@@ -752,9 +809,9 @@ impl Notifier {
         };
 
         let event_plan_hash = compute_plan_hash(event);
-        let chunks = self.split_into_chunks(message_text);
+        let fresh_chunks = self.split_into_chunks(message_text);
 
-        let (starting_chunk, starting_attempt, is_exhausted) = {
+        let (plan_chunks, starting_chunk, starting_attempt, is_exhausted) = {
             let mut state = self.delivery_state.lock().unwrap();
             if let Some(inc) = state.incidents.get_mut(&inc_id.key) {
                 let rec =
@@ -763,6 +820,7 @@ impl Notifier {
                         .or_insert_with(|| GenerationRecord {
                             plan_hash: event_plan_hash,
                             plan_severity: event.severity,
+                            chunks: fresh_chunks.clone(),
                             confirmed_chunks: 0,
                             attempts: 0,
                             exhausted: false,
@@ -775,26 +833,33 @@ impl Notifier {
                     // Reset to a fresh plan and attempt budget for this urgent notification!
                     rec.plan_hash = event_plan_hash;
                     rec.plan_severity = event.severity;
+                    rec.chunks = fresh_chunks.clone();
                     rec.confirmed_chunks = 0;
                     rec.attempts = 0;
                     rec.exhausted = false;
                     rec.exhausted_at = None;
-                    (0, 0, false)
+                    (rec.chunks.clone(), 0, 0, false)
                 } else if rec.exhausted || rec.attempts >= 3 {
                     rec.exhausted = true;
-                    (0, 3, true)
+                    (rec.chunks.clone(), 0, 3, true)
                 } else if rec.plan_hash != event_plan_hash {
                     // Plan content changed at same severity:
                     rec.plan_hash = event_plan_hash;
                     rec.plan_severity = event.severity;
+                    rec.chunks = fresh_chunks.clone();
                     rec.confirmed_chunks = 0;
-                    (0, rec.attempts, false)
+                    (rec.chunks.clone(), 0, rec.attempts, false)
                 } else {
-                    // Identical plan: resume from confirmed chunks with remaining attempts!
-                    (rec.confirmed_chunks, rec.attempts, false)
+                    // Identical plan: resume from confirmed chunks with stored immutable chunks!
+                    (
+                        rec.chunks.clone(),
+                        rec.confirmed_chunks,
+                        rec.attempts,
+                        false,
+                    )
                 }
             } else {
-                (0, 0, false)
+                (fresh_chunks, 0, 0, false)
             }
         };
 
@@ -808,7 +873,7 @@ impl Notifier {
             ));
         }
 
-        if starting_chunk >= chunks.len() {
+        if starting_chunk >= plan_chunks.len() {
             return Ok(());
         }
 
@@ -819,10 +884,10 @@ impl Notifier {
         for attempt in starting_attempt..3 {
             let mut send_err = None;
 
-            while confirmed_chunks < chunks.len() {
+            while confirmed_chunks < plan_chunks.len() {
                 self.wait_for_rate_limit(shutdown_rx).await?;
 
-                let chunk = &chunks[confirmed_chunks];
+                let chunk = &plan_chunks[confirmed_chunks];
                 let body = json!({
                     "chat_id": tg.chat_id,
                     "text": chunk,
@@ -916,7 +981,7 @@ impl Notifier {
                 }
             }
 
-            if confirmed_chunks == chunks.len() {
+            if confirmed_chunks == plan_chunks.len() {
                 info!("Dispatched Telegram notification to chat '{}'", tg.chat_id);
                 return Ok(());
             }
