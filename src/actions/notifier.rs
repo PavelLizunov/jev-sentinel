@@ -87,9 +87,17 @@ pub struct IncidentId {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct GenerationRecord {
+    pub confirmed_chunks: usize,
+    pub attempts: usize,
+    pub exhausted: bool,
+    pub delivered_cooldown: Option<(AlertSeverity, std::time::Instant)>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct IncidentState {
     pub current_generation: u64,
-    pub delivered_generations: HashMap<u64, (AlertSeverity, std::time::Instant)>,
+    pub records: HashMap<u64, GenerationRecord>,
 }
 
 #[derive(Default)]
@@ -238,10 +246,19 @@ impl Notifier {
         }
 
         // Suppress duplicate if this exact generation was delivered recently with same or higher severity
-        if let Some(&(prev_sev, sent_at)) = incident.delivered_generations.get(&event.generation) {
-            if event.severity <= prev_sev && sent_at.elapsed() < Duration::from_secs(300) {
-                debug!("Suppressed duplicate alert for {:?}", key);
+        if let Some(rec) = incident.records.get(&event.generation) {
+            if rec.exhausted {
+                debug!(
+                    "Discarding repeat for exhausted incident generation {:?}",
+                    key
+                );
                 return false;
+            }
+            if let Some(&(prev_sev, sent_at)) = rec.delivered_cooldown.as_ref() {
+                if event.severity <= prev_sev && sent_at.elapsed() < Duration::from_secs(300) {
+                    debug!("Suppressed duplicate alert for {:?}", key);
+                    return false;
+                }
             }
         }
 
@@ -289,6 +306,13 @@ impl Notifier {
         true
     }
 
+    pub fn close_admission(&self) {
+        if let Ok(mut state) = self.delivery_state.lock() {
+            state.is_closed = true;
+        }
+        self.notify.notify_waiters();
+    }
+
     pub fn pop_next_pending(&self) -> Option<AlertEvent> {
         let mut state = self.delivery_state.lock().unwrap();
         while !state.pending.is_empty() {
@@ -300,19 +324,26 @@ impl Notifier {
 
             let event = state.pending.remove(&id_to_pop)?;
 
-            // Check if this incident generation was already delivered at equal/higher severity
+            // Check if this incident generation was already delivered or exhausted
             if let Some(inc) = state.incidents.get(&id_to_pop.key) {
-                if let Some(&(delivered_sev, sent_at)) =
-                    inc.delivered_generations.get(&event.generation)
-                {
-                    if event.severity <= delivered_sev
-                        && sent_at.elapsed() < Duration::from_secs(300)
-                    {
+                if let Some(rec) = inc.records.get(&event.generation) {
+                    if rec.exhausted {
                         debug!(
-                            "Discarding redundant pending repeat covered by delivered generation: {:?}",
+                            "Discarding popped repeat for exhausted incident: {:?}",
                             id_to_pop
                         );
                         continue;
+                    }
+                    if let Some(&(delivered_sev, sent_at)) = rec.delivered_cooldown.as_ref() {
+                        if event.severity <= delivered_sev
+                            && sent_at.elapsed() < Duration::from_secs(300)
+                        {
+                            debug!(
+                                "Discarding redundant pending repeat covered by delivered generation: {:?}",
+                                id_to_pop
+                            );
+                            continue;
+                        }
                     }
                 }
             }
@@ -331,10 +362,20 @@ impl Notifier {
 
         let mut state = self.delivery_state.lock().unwrap();
         if let Some(inc) = state.incidents.get_mut(&key) {
-            inc.delivered_generations.insert(
-                event.generation,
-                (event.severity, std::time::Instant::now()),
-            );
+            let rec = inc.records.entry(event.generation).or_default();
+            rec.delivered_cooldown = Some((event.severity, std::time::Instant::now()));
+
+            // Prune old historical records (>600s) to keep memory bounded
+            inc.records.retain(|&gen, r| {
+                if gen == inc.current_generation {
+                    return true;
+                }
+                if let Some((_, sent_at)) = r.delivered_cooldown {
+                    sent_at.elapsed() < Duration::from_secs(600)
+                } else {
+                    !r.exhausted
+                }
+            });
 
             if inc.current_generation == event.generation {
                 debug!(
@@ -398,7 +439,7 @@ impl Notifier {
                 _ = self.notify.notified() => {
                     while let Some(event) = self.pop_next_pending() {
                         let formatted = self.format_alert_event(&event);
-                        if let Err(e) = self.send_raw_message(&formatted).await {
+                        if let Err(e) = self.send_alert_message(&event, &formatted, Some(&shutdown_rx)).await {
                             error!("Alert delivery failed after retries for {:?}: {}", event.target_id, e);
                         } else {
                             self.commit_delivery(&event);
@@ -463,8 +504,275 @@ impl Notifier {
         }
 
         let formatted = self.format_alert_event(event);
-        self.send_raw_message(&formatted).await?;
+        self.send_alert_message(event, &formatted, None).await?;
         Ok(self.commit_delivery(event))
+    }
+
+    fn split_into_chunks(&self, message_text: &str) -> Vec<String> {
+        let mut chunks = Vec::new();
+        let mut current_chunk = String::new();
+        for line in message_text.lines() {
+            if current_chunk.chars().count() + line.chars().count() + 1 > 3900
+                && !current_chunk.is_empty()
+            {
+                chunks.push(current_chunk);
+                current_chunk = String::new();
+            }
+            if !current_chunk.is_empty() {
+                current_chunk.push('\n');
+            }
+            current_chunk.push_str(line);
+        }
+        if !current_chunk.is_empty() {
+            chunks.push(current_chunk);
+        }
+        chunks
+    }
+
+    fn extract_retry_after(&self, text: &str) -> Option<u64> {
+        if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(text) {
+            err_json
+                .get("parameters")
+                .and_then(|p| p.get("retry_after"))
+                .and_then(|v| v.as_u64())
+        } else {
+            None
+        }
+    }
+
+    fn record_rate_limit(&self, wait_sec: u64) {
+        let new_deadline = std::time::Instant::now() + Duration::from_secs(wait_sec);
+        let mut guard = self.rate_limit_until.lock().unwrap();
+        *guard = Some(match *guard {
+            Some(old) => old.max(new_deadline),
+            None => new_deadline,
+        });
+    }
+
+    async fn wait_for_rate_limit(
+        &self,
+        shutdown_rx: Option<&tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<()> {
+        loop {
+            let wait = {
+                let guard = self.rate_limit_until.lock().unwrap();
+                if let Some(until) = *guard {
+                    let now = std::time::Instant::now();
+                    if until > now {
+                        Some(until - now)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            if let Some(duration) = wait {
+                debug!(
+                    "Observing Telegram rate limit embargo, sleeping {:?}",
+                    duration
+                );
+                if let Some(rx) = shutdown_rx {
+                    let mut rx_clone = rx.clone();
+                    tokio::select! {
+                        _ = tokio::time::sleep(duration) => {}
+                        _ = rx_clone.changed() => {
+                            if *rx_clone.borrow() {
+                                return Err(SentinelError::Action("Interrupted by shutdown".into()));
+                            }
+                        }
+                    }
+                } else {
+                    tokio::time::sleep(duration).await;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_alert_message(
+        &self,
+        event: &AlertEvent,
+        message_text: &str,
+        shutdown_rx: Option<&tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<()> {
+        let Some(tg) = &self.telegram else {
+            return Ok(());
+        };
+
+        let inc_id = IncidentId {
+            key: DeduplicationKey {
+                source: event.source,
+                target_id: event.target_id.clone(),
+                reason_code: event.reason_code,
+            },
+            generation: event.generation,
+        };
+
+        let (starting_chunk, is_exhausted) = {
+            let state = self.delivery_state.lock().unwrap();
+            if let Some(inc) = state.incidents.get(&inc_id.key) {
+                if let Some(rec) = inc.records.get(&inc_id.generation) {
+                    (rec.confirmed_chunks, rec.exhausted)
+                } else {
+                    (0, false)
+                }
+            } else {
+                (0, false)
+            }
+        };
+
+        if is_exhausted {
+            debug!(
+                "Skipping send: incident generation {:?} is already exhausted",
+                inc_id
+            );
+            return Err(SentinelError::Action(
+                "Delivery attempts exhausted for this incident generation".into(),
+            ));
+        }
+
+        let chunks = self.split_into_chunks(message_text);
+        if starting_chunk >= chunks.len() {
+            return Ok(());
+        }
+
+        let mut confirmed_chunks = starting_chunk;
+        let tg_url = format!("https://api.telegram.org/bot{}/sendMessage", tg.bot_token);
+        let mut last_err = None;
+
+        for attempt in 0..3 {
+            let mut send_err = None;
+
+            while confirmed_chunks < chunks.len() {
+                if let Some(rx) = shutdown_rx {
+                    if *rx.borrow() {
+                        return Err(SentinelError::Action("Interrupted by shutdown".into()));
+                    }
+                }
+
+                self.wait_for_rate_limit(shutdown_rx).await?;
+
+                let chunk = &chunks[confirmed_chunks];
+                let body = json!({
+                    "chat_id": tg.chat_id,
+                    "text": chunk,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": true
+                });
+
+                let send_res = self.client.post(&tg_url).json(&body).send().await;
+                let resp = match send_res {
+                    Ok(r) => r,
+                    Err(e) => {
+                        send_err = Some(SentinelError::Action(format!(
+                            "Network error sending Telegram message: {}",
+                            e
+                        )));
+                        break;
+                    }
+                };
+
+                let status = resp.status();
+                if status.as_u16() == 429 {
+                    let err_text = resp.text().await.unwrap_or_default();
+                    let wait_sec = self.extract_retry_after(&err_text).unwrap_or(5);
+                    self.record_rate_limit(wait_sec);
+                    send_err = Some(SentinelError::Action(format!(
+                        "Telegram API HTTP 429: {}",
+                        err_text
+                    )));
+                    break;
+                }
+
+                let check_res = if status.as_u16() == 400 {
+                    let fallback_body = json!({
+                        "chat_id": tg.chat_id,
+                        "text": truncate_field(chunk, 4096),
+                        "disable_web_page_preview": true
+                    });
+                    match self.client.post(&tg_url).json(&fallback_body).send().await {
+                        Ok(fb_resp) => {
+                            let fb_status = fb_resp.status();
+                            if fb_status.as_u16() == 429 {
+                                let err_text = fb_resp.text().await.unwrap_or_default();
+                                let wait_sec = self.extract_retry_after(&err_text).unwrap_or(5);
+                                self.record_rate_limit(wait_sec);
+                                Err(SentinelError::Action(format!(
+                                    "Telegram API fallback HTTP 429: {}",
+                                    err_text
+                                )))
+                            } else {
+                                Self::check_telegram_response(fb_resp).await
+                            }
+                        }
+                        Err(e) => Err(SentinelError::Action(format!(
+                            "Network error in Telegram fallback: {}",
+                            e
+                        ))),
+                    }
+                } else {
+                    Self::check_telegram_response(resp).await
+                };
+
+                match check_res {
+                    Ok(()) => {
+                        confirmed_chunks += 1;
+                        let mut state = self.delivery_state.lock().unwrap();
+                        if let Some(inc) = state.incidents.get_mut(&inc_id.key) {
+                            let rec = inc.records.entry(inc_id.generation).or_default();
+                            rec.confirmed_chunks = confirmed_chunks;
+                        }
+                    }
+                    Err(e) => {
+                        send_err = Some(e);
+                        break;
+                    }
+                }
+            }
+
+            if confirmed_chunks == chunks.len() {
+                info!("Dispatched Telegram notification to chat '{}'", tg.chat_id);
+                return Ok(());
+            }
+
+            last_err = send_err;
+            if attempt < 2 {
+                if let Some(rx) = shutdown_rx {
+                    let mut rx_clone = rx.clone();
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                        _ = rx_clone.changed() => {
+                            if *rx_clone.borrow() {
+                                return Err(SentinelError::Action("Interrupted by shutdown".into()));
+                            }
+                        }
+                    }
+                } else {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+        }
+
+        // Exhausted attempts: update attempt count and mark exhausted if >= 3
+        {
+            let mut state = self.delivery_state.lock().unwrap();
+            if let Some(inc) = state.incidents.get_mut(&inc_id.key) {
+                let rec = inc.records.entry(inc_id.generation).or_default();
+                rec.attempts = rec.attempts.saturating_add(3);
+                if rec.attempts >= 3 {
+                    rec.exhausted = true;
+                    debug!("Marked incident generation {:?} as exhausted", inc_id);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            SentinelError::Action("Failed to deliver alert after retries".into())
+        }))
     }
 
     pub async fn dispatch_decision(
@@ -501,7 +809,23 @@ impl Notifier {
         snapshot: &InfrastructureSnapshot,
     ) -> Result<()> {
         let message_text = self.format_decision_message(decision, snapshot);
-        self.send_raw_message(&message_text).await
+        let event = self.build_alert_event(
+            AlertSource::JevAdvisor,
+            None,
+            if decision.is_critical() {
+                AlertSeverity::Critical
+            } else if decision.is_warning() {
+                AlertSeverity::Warning
+            } else {
+                AlertSeverity::Info
+            },
+            AlertReason::RiskElevated,
+            format!("Jev System 1: {}", decision.system_health.to_uppercase()),
+            &message_text,
+        );
+        self.send_alert_message(&event, &message_text, None).await?;
+        self.commit_delivery(&event);
+        Ok(())
     }
 
     pub async fn send_test_alert(&self) -> Result<()> {
@@ -534,7 +858,15 @@ impl Notifier {
         ];
 
         let message_text = lines.join("\n");
-        self.send_raw_message(&message_text).await
+        let event = self.build_alert_event(
+            AlertSource::LocalRule,
+            None,
+            AlertSeverity::Info,
+            AlertReason::RiskElevated,
+            "Telegram Alert Test",
+            &message_text,
+        );
+        self.send_alert_message(&event, &message_text, None).await
     }
 
     fn format_decision_message(
@@ -597,164 +929,6 @@ impl Notifier {
         }
 
         lines.join("\n")
-    }
-
-    async fn send_raw_message(&self, message_text: &str) -> Result<()> {
-        let Some(tg) = &self.telegram else {
-            return Ok(());
-        };
-
-        let tg_url = format!("https://api.telegram.org/bot{}/sendMessage", tg.bot_token);
-
-        // Group lines into chunks bounded to 3900 characters without splitting HTML tags
-        let mut chunks = Vec::new();
-        let mut current_chunk = String::new();
-        for line in message_text.lines() {
-            if current_chunk.chars().count() + line.chars().count() + 1 > 3900
-                && !current_chunk.is_empty()
-            {
-                chunks.push(current_chunk);
-                current_chunk = String::new();
-            }
-            if !current_chunk.is_empty() {
-                current_chunk.push('\n');
-            }
-            current_chunk.push_str(line);
-        }
-        if !current_chunk.is_empty() {
-            chunks.push(current_chunk);
-        }
-
-        let mut confirmed_chunks = 0usize;
-        let mut last_err = None;
-
-        for attempt in 0..3 {
-            let mut send_err = None;
-
-            while confirmed_chunks < chunks.len() {
-                // Obey global Telegram rate limit embargo before issuing any HTTP request
-                let embargo = {
-                    let guard = self.rate_limit_until.lock().unwrap();
-                    *guard
-                };
-                if let Some(until) = embargo {
-                    let now = std::time::Instant::now();
-                    if until > now {
-                        let wait = until - now;
-                        debug!("Observing Telegram rate limit embargo, sleeping {:?}", wait);
-                        tokio::time::sleep(wait).await;
-                    }
-                }
-
-                let chunk = &chunks[confirmed_chunks];
-                let body = json!({
-                    "chat_id": tg.chat_id,
-                    "text": chunk,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": true
-                });
-
-                let send_res = self.client.post(&tg_url).json(&body).send().await;
-                let resp = match send_res {
-                    Ok(r) => r,
-                    Err(e) => {
-                        send_err = Some(SentinelError::Action(format!(
-                            "Network error sending Telegram message: {}",
-                            e
-                        )));
-                        break;
-                    }
-                };
-
-                let status = resp.status();
-                if status.as_u16() == 429 {
-                    let err_text = resp.text().await.unwrap_or_default();
-                    let mut wait_sec = 5u64;
-                    if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&err_text) {
-                        if let Some(sec) = err_json
-                            .get("parameters")
-                            .and_then(|p| p.get("retry_after"))
-                            .and_then(|v| v.as_u64())
-                        {
-                            wait_sec = sec;
-                        }
-                    }
-                    *self.rate_limit_until.lock().unwrap() =
-                        Some(std::time::Instant::now() + Duration::from_secs(wait_sec));
-                    send_err = Some(SentinelError::Action(format!(
-                        "Telegram API HTTP 429: {}",
-                        err_text
-                    )));
-                    break;
-                }
-
-                let check_res = if status.as_u16() == 400 {
-                    let fallback_body = json!({
-                        "chat_id": tg.chat_id,
-                        "text": truncate_field(chunk, 4096),
-                        "disable_web_page_preview": true
-                    });
-                    match self.client.post(&tg_url).json(&fallback_body).send().await {
-                        Ok(fb_resp) => {
-                            let fb_status = fb_resp.status();
-                            if fb_status.as_u16() == 429 {
-                                let err_text = fb_resp.text().await.unwrap_or_default();
-                                let mut wait_sec = 5u64;
-                                if let Ok(err_json) =
-                                    serde_json::from_str::<serde_json::Value>(&err_text)
-                                {
-                                    if let Some(sec) = err_json
-                                        .get("parameters")
-                                        .and_then(|p| p.get("retry_after"))
-                                        .and_then(|v| v.as_u64())
-                                    {
-                                        wait_sec = sec;
-                                    }
-                                }
-                                *self.rate_limit_until.lock().unwrap() =
-                                    Some(std::time::Instant::now() + Duration::from_secs(wait_sec));
-                                Err(SentinelError::Action(format!(
-                                    "Telegram API fallback HTTP 429: {}",
-                                    err_text
-                                )))
-                            } else {
-                                Self::check_telegram_response(fb_resp).await
-                            }
-                        }
-                        Err(e) => Err(SentinelError::Action(format!(
-                            "Network error in Telegram fallback: {}",
-                            e
-                        ))),
-                    }
-                } else {
-                    Self::check_telegram_response(resp).await
-                };
-
-                match check_res {
-                    Ok(()) => {
-                        confirmed_chunks += 1;
-                    }
-                    Err(e) => {
-                        send_err = Some(e);
-                        break;
-                    }
-                }
-            }
-
-            if confirmed_chunks == chunks.len() {
-                info!("Dispatched Telegram notification to chat '{}'", tg.chat_id);
-                return Ok(());
-            }
-
-            last_err = send_err;
-            if attempt < 2 {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| {
-            SentinelError::Action("Failed to deliver alert after retries".into())
-        }))
     }
 
     async fn check_telegram_response(resp: reqwest::Response) -> Result<()> {
