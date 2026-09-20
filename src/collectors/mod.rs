@@ -2,10 +2,11 @@ pub mod exec;
 pub mod http;
 pub mod macos;
 pub mod nvidia;
+pub mod runner;
 pub mod tcp;
 
 use crate::config::TargetConfig;
-use crate::core::models::{InfrastructureSnapshot, TargetTelemetry};
+use crate::core::models::{InfrastructureSnapshot, TargetStatus, TargetTelemetry};
 use chrono::Utc;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -95,9 +96,22 @@ pub async fn collect_all(targets: &[TargetConfig], concurrency: usize) -> Infras
     }
 
     let mut telemetries = Vec::with_capacity(tasks.len());
-    for task in tasks {
-        if let Ok(telemetry) = task.await {
-            telemetries.push(telemetry);
+    for (i, task) in tasks.into_iter().enumerate() {
+        match task.await {
+            Ok(telemetry) => telemetries.push(telemetry),
+            Err(join_err) => {
+                let target = &targets[i];
+                telemetries.push(TargetTelemetry {
+                    target_name: target.name().to_string(),
+                    target_type: target.type_name().to_string(),
+                    status: TargetStatus::Unknown,
+                    latency_ms: 0.0,
+                    metrics: serde_json::json!({ "internal_error": join_err.to_string() }),
+                    error_message: Some(format!("Collector task join error: {}", join_err)),
+                    timestamp: Utc::now(),
+                    observed_at: Some(std::time::Instant::now()),
+                });
+            }
         }
     }
 

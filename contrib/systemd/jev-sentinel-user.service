@@ -1,0 +1,26 @@
+[Unit]
+Description=Jev Sentinel — System 1 Infrastructure Watchdog & Self-Healing Daemon (User Service)
+Documentation=https://github.com/PavelLizunov/jev-sentinel
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+
+# Load environment variables (API keys, proxies, bot tokens)
+EnvironmentFile=-%h/.config/jev-sentinel/env
+
+# Executable path: checks ~/.cargo/bin or /usr/local/bin
+ExecStart=%h/.cargo/bin/jev-sentinel run --config %h/.config/jev-sentinel/sentinel.yaml
+
+# Keep running automatically
+Restart=always
+RestartSec=10s
+
+# Logging directly to user journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jev-sentinel
+
+[Install]
+WantedBy=default.target

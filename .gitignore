@@ -2,4 +2,11 @@
 **/*.rs.bk
 *.log
 sentinel.test.yaml
+sentinel.homelab-full.yaml
+sentinel.*.local.yaml
+*.local.yaml
 .env
+.dsh/
+*.zip
+benchmark_results.json
+soak_benchmark.py

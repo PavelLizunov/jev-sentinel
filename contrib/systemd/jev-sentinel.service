@@ -1,0 +1,37 @@
+[Unit]
+Description=Jev Sentinel — Autonomous System 1 Infrastructure Watchdog & Self-Healing Daemon
+Documentation=https://github.com/PavelLizunov/jev-sentinel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# For system-wide deployment: adjust User/Group if running under a dedicated service account
+# or keep root if exec_probe requires elevated host/container inspection.
+# User=sentinel
+# Group=sentinel
+
+# Load environment variables (API keys, proxies, bot tokens)
+EnvironmentFile=-/etc/default/jev-sentinel
+EnvironmentFile=-/etc/jev-sentinel/env
+
+# Main execution command
+ExecStart=/usr/local/bin/jev-sentinel run --config /etc/jev-sentinel/sentinel.yaml
+
+# Restart continuously on failure or crash
+Restart=always
+RestartSec=10s
+
+# Resource limits & modern security hardening
+LimitNOFILE=65536
+ProtectSystem=full
+PrivateTmp=true
+NoNewPrivileges=true
+
+# Logging directly to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jev-sentinel
+
+[Install]
+WantedBy=multi-user.target

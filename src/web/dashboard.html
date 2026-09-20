@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Jev Sentinel — Fleet observations</title>
+  <link rel="stylesheet" href="/dashboard.css">
+  <script src="/i18n.js" defer></script>
+  <script src="/dashboard.js" defer></script>
+</head>
+<body>
+<main>
+  <header class="topline">
+    <div><h1>Jev Sentinel</h1><p class="subtitle" data-i18n="app.subtitle">Fleet observations · no automated actions</p></div>
+    <div class="filters">
+      <label class="language-control"><span data-i18n="language.label">Language</span><select id="languageSelect">
+        <option value="en">English</option><option value="ru">Русский</option><option value="de">Deutsch</option><option value="fr">Français</option><option value="es">Español</option><option value="pt-BR">Português (Brasil)</option><option value="zh-CN">简体中文</option><option value="ja">日本語</option>
+      </select></label>
+      <button id="categorize" type="button" data-i18n="button.categorize">Categorize with Jev</button>
+      <button id="categoryButton" type="button" data-i18n="button.add_category">Add category</button>
+      <button id="tokenButton" type="button" data-i18n="button.jev_key">Jev key</button>
+    </div>
+  </header>
+  <p id="translationNote" class="translation-note muted" data-i18n="language.machine_note" hidden>Machine translation · not reviewed by a native speaker</p>
+  <p id="localeMessage" class="notice" role="status" hidden></p>
+  <section class="summary" aria-label="All probes, regardless of filters" data-i18n-aria="summary.label">
+    <span><strong id="total">—</strong><span id="summaryProbes">probes</span></span>
+    <span><strong id="count-healthy">—</strong><span data-i18n="summary.healthy">OK</span></span>
+    <span><strong id="count-degraded">—</strong><span data-i18n="summary.degraded">degraded</span></span>
+    <span><strong id="count-failed">—</strong><span data-i18n="summary.failed">failed</span></span>
+    <span><strong id="count-unknown">—</strong><span data-i18n="summary.unknown">unknown</span></span>
+    <span><strong id="count-stale">—</strong><span data-i18n="summary.stale">stale</span></span>
+  </section>
+  <section id="fleetOverview" class="fleet" aria-labelledby="fleetTitle">
+    <div class="fleet-head">
+      <h2 id="fleetTitle" data-i18n="fleet.label">Probe map</h2>
+      <button id="fleetToggle" type="button" aria-expanded="true" aria-controls="fleetContent" data-i18n="fleet.hide">Hide map</button>
+    </div>
+    <div id="fleetContent">
+      <p class="muted" data-i18n="fleet.summary">All probes, regardless of filters. Select a cell for details.</p>
+      <div id="fleetMap" class="fleet-map" tabindex="0" role="group" aria-label="Probe map" data-i18n-aria="fleet.label"></div>
+    </div>
+  </section>
+  <div class="toolbar">
+    <div class="view-buttons" role="group" aria-label="Display density" data-i18n-aria="view.label">
+      <button type="button" data-view="cards" aria-pressed="false" data-i18n="view.cards">Cards</button>
+      <button type="button" data-view="compact" aria-pressed="true" data-i18n="view.compact">Compact</button>
+      <button type="button" data-view="table" aria-pressed="false" data-i18n="view.table">Table</button>
+    </div>
+    <div class="filters">
+      <label><span data-i18n="filter.search">Search</span><input id="search" type="search" placeholder="Name, ID, type or category" data-i18n-placeholder="filter.search_placeholder" aria-describedby="activeFilters"></label>
+      <label><span data-i18n="filter.category">Category</span><select id="category"><option value="" data-i18n="filter.all_categories">All categories</option></select></label>
+      <label><span data-i18n="filter.group">Group</span><select id="group"><option value="none" data-i18n="filter.none">None</option><option value="category" data-i18n="filter.group_category">Category</option></select></label>
+      <label><span data-i18n="filter.sort">Sort</span><select id="sort"><option value="name" data-i18n="filter.name">Name</option><option value="state" data-i18n="filter.state">State</option><option value="cpu" data-i18n="metric.cpu">CPU</option><option value="ram" data-i18n="metric.ram">RAM</option><option value="latency" data-i18n="metric.latency">Latency</option><option value="age" data-i18n="filter.age">Age</option></select></label>
+      <label class="checkbox-label"><span data-i18n="filter.issues">Issues only</span><input id="issues" type="checkbox"></label>
+      <button id="clearFilters" type="button" data-i18n="filter.clear">Clear filters</button>
+    </div>
+  </div>
+  <p id="activeFilters" class="active-filters"></p>
+  <section id="results" class="results" tabindex="0" aria-label="Probe measurements" data-i18n-aria="table.label">
+  <p id="resultCount" role="status">Waiting for observations…</p>
+  <div id="filterFeedback" class="filter-feedback" hidden>
+    <p id="hiddenMatches" role="status"></p>
+    <button id="showAllMatches" type="button" data-i18n="filter.show_all_matches">Show matches across all probes</button>
+  </div>
+  <div class="statusline" aria-label="Independent monitoring states" data-i18n-aria="connection.label">
+    <span id="connection">HTTP: connecting</span>
+    <span id="telemetry">Telemetry: waiting</span>
+    <span id="advisor">Jev: unavailable</span>
+  </div>
+  <p id="connectionError" class="notice" role="status" hidden></p>
+  <p id="attention" class="notice" hidden></p>
+  <div class="advice">
+    <span><span data-i18n="advice.health_label">Jev health:</span> <b id="health">Unknown</b></span>
+    <span><span data-i18n="advice.risk_label">Risk score:</span> <b id="risk" class="number">—</b></span>
+    <span><span data-i18n="advice.suggestion_label">Suggestion:</span> <b id="advice">No current advice</b></span>
+  </div>
+  <p id="advisorError" class="notice" hidden></p>
+  <p id="operationMessage" role="status"></p>
+  <div id="grid" class="grid compact"></div>
+  <div id="tableWrap" class="table-wrap" hidden>
+    <table aria-label="Probe measurements" data-i18n-aria="table.label">
+      <thead><tr>
+        <th scope="col"><button type="button" data-sort="name" data-i18n="table.probe">Probe</button></th>
+        <th scope="col"><button type="button" data-sort="state" data-i18n="filter.state">State</button></th>
+        <th scope="col" class="desktop"><button type="button" data-sort="cpu" data-i18n="metric.cpu">CPU</button></th>
+        <th scope="col" class="desktop"><button type="button" data-sort="ram" data-i18n="metric.ram">RAM</button></th>
+        <th scope="col" class="swap-column" data-i18n="metric.swap">Swap</th>
+        <th scope="col"><button type="button" data-sort="latency" data-i18n="metric.latency">Latency</button></th>
+        <th scope="col" class="desktop"><button type="button" data-sort="age" data-i18n="filter.age">Age</button></th>
+      </tr></thead>
+      <tbody id="tableBody"></tbody>
+    </table>
+  </div>
+  <p id="empty" class="empty">Loading observations…</p>
+  </section>
+  <footer data-i18n="footer.note">Unknown means unavailable evidence, not a confirmed service failure. Histories reset when the daemon restarts. Risk is a score, not a measured outage probability.</footer>
+</main>
+<dialog id="detailDialog" aria-labelledby="detailTitle">
+  <div class="dialog-head"><h2 id="detailTitle">Probe details</h2><button type="button" data-close="detailDialog" data-i18n="button.close" autofocus>Close</button></div>
+  <p id="detailMeta" class="muted"></p>
+  <p id="detailError"></p>
+  <p id="detailResources"></p>
+  <p id="memoryBasis" class="muted"></p>
+  <div id="detailCharts"></div>
+  <p id="detailId" class="muted"></p>
+  <h3 data-i18n="details.raw_heading">Allowlisted probe metrics</h3>
+  <pre id="detailRaw"></pre>
+</dialog>
+<dialog id="tokenDialog" aria-labelledby="tokenTitle">
+  <div class="dialog-head"><h2 id="tokenTitle" data-i18n="key.title">Jev categorization key</h2><button type="button" data-close="tokenDialog" data-i18n="button.close" autofocus>Close</button></div>
+  <p class="muted" data-i18n="key.explanation">This key applies to manual categorization only. Daemon evaluation uses its configured key. Use this interface only over a trusted connection.</p>
+  <p id="keyStatus">Loading key status…</p>
+  <form id="tokenForm">
+    <label><span data-i18n="key.label">API key</span><input id="keyInput" type="password" autocomplete="off" required maxlength="1024"></label>
+    <p id="tokenMessage" class="form-message" role="status"></p>
+    <div class="dialog-actions"><button type="button" id="resetKey" data-i18n="key.use_server">Use server key</button><button class="primary" type="submit" id="saveKey" data-i18n="key.save">Verify and save</button></div>
+  </form>
+</dialog>
+<dialog id="categoryDialog" aria-labelledby="categoryTitle">
+  <div class="dialog-head"><h2 id="categoryTitle" data-i18n="category_form.title">Add category</h2><button type="button" data-close="categoryDialog" data-i18n="button.close" autofocus>Close</button></div>
+  <div class="category-list-wrap">
+    <h3 data-i18n="category_form.existing" style="font-size: 13px; margin: 0 0 8px;">Current categories</h3>
+    <ul id="categoryList" class="category-list"></ul>
+  </div>
+  <form id="categoryForm">
+    <label><span data-i18n="category_form.id">Identifier</span><input id="categoryId" required maxlength="64" pattern="[a-z][a-z0-9_]*" placeholder="databases"></label>
+    <label><span data-i18n="category_form.label">Label</span><input id="categoryLabel" required maxlength="80"></label>
+    <label><span data-i18n="category_form.description">Classification criterion</span><input id="categoryDescription" required maxlength="512"></label>
+    <p id="categoryMessage" class="form-message" role="status"></p>
+    <div class="dialog-actions"><button class="primary" type="submit" id="saveCategory" data-i18n="category_form.save">Save category</button></div>
+  </form>
+</dialog>
+</body>
+</html>

@@ -17,7 +17,7 @@ pub async fn collect_tcp(
 
     let res = timeout(
         Duration::from_secs(timeout_seconds),
-        TcpStream::connect(&addr),
+        TcpStream::connect((host.as_str(), port)),
     )
     .await;
 
@@ -25,7 +25,10 @@ pub async fn collect_tcp(
 
     match res {
         Ok(Ok(_stream)) => {
-            debug!("TCP ping '{}' ({}) succeeded in {:.1}ms", name, addr, latency_ms);
+            debug!(
+                "TCP ping '{}' ({}) succeeded in {:.1}ms",
+                name, addr, latency_ms
+            );
             TargetTelemetry {
                 target_name: name,
                 target_type: "tcp_ping".to_string(),
@@ -38,6 +41,7 @@ pub async fn collect_tcp(
                 }),
                 error_message: None,
                 timestamp: Utc::now(),
+                observed_at: Some(Instant::now()),
             }
         }
         Ok(Err(e)) => {
@@ -54,10 +58,14 @@ pub async fn collect_tcp(
                 }),
                 error_message: Some(e.to_string()),
                 timestamp: Utc::now(),
+                observed_at: Some(Instant::now()),
             }
         }
         Err(_) => {
-            debug!("TCP ping '{}' ({}) timed out after {}s", name, addr, timeout_seconds);
+            debug!(
+                "TCP ping '{}' ({}) timed out after {}s",
+                name, addr, timeout_seconds
+            );
             TargetTelemetry {
                 target_name: name,
                 target_type: "tcp_ping".to_string(),
@@ -70,6 +78,7 @@ pub async fn collect_tcp(
                 }),
                 error_message: Some(format!("Connection timed out after {}s", timeout_seconds)),
                 timestamp: Utc::now(),
+                observed_at: Some(Instant::now()),
             }
         }
     }

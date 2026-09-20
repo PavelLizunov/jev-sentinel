@@ -2,8 +2,21 @@ use crate::core::models::{TargetStatus, TargetTelemetry};
 use chrono::Utc;
 use reqwest::Client;
 use serde_json::json;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tracing::debug;
+
+static HTTP_CLIENT_POOL: OnceLock<Client> = OnceLock::new();
+
+fn get_shared_client() -> &'static Client {
+    HTTP_CLIENT_POOL.get_or_init(|| {
+        Client::builder()
+            .pool_max_idle_per_host(8)
+            .tcp_keepalive(Some(Duration::from_secs(30)))
+            .build()
+            .unwrap_or_else(|_| Client::new())
+    })
+}
 
 pub async fn collect_http(
     name: String,
@@ -13,25 +26,11 @@ pub async fn collect_http(
     headers: std::collections::HashMap<String, String>,
 ) -> TargetTelemetry {
     let t0 = Instant::now();
-    let client = match Client::builder()
-        .timeout(Duration::from_secs(timeout_seconds))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return TargetTelemetry {
-                target_name: name,
-                target_type: "http_probe".to_string(),
-                status: TargetStatus::Unreachable,
-                latency_ms: 0.0,
-                metrics: json!({ "error": e.to_string() }),
-                error_message: Some(e.to_string()),
-                timestamp: Utc::now(),
-            }
-        }
-    };
+    let client = get_shared_client();
 
-    let mut req = client.get(&url);
+    let mut req = client
+        .get(&url)
+        .timeout(Duration::from_secs(timeout_seconds));
     for (k, v) in headers {
         req = req.header(k, v);
     }
@@ -40,12 +39,13 @@ pub async fn collect_http(
         Ok(resp) => {
             let latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
             let status_code = resp.status().as_u16();
+            let _ = resp.bytes().await; // Drain body to allow connection reuse in HTTP pool
             let is_match = status_code == expected_status;
 
             let status = if is_match {
                 TargetStatus::Online
             } else if status_code >= 500 {
-                TargetStatus::Degraded
+                TargetStatus::Unreachable
             } else {
                 TargetStatus::Degraded
             };
@@ -72,6 +72,7 @@ pub async fn collect_http(
                     Some(format!("Unexpected HTTP status {}", status_code))
                 },
                 timestamp: Utc::now(),
+                observed_at: Some(Instant::now()),
             }
         }
         Err(e) => {
@@ -94,6 +95,7 @@ pub async fn collect_http(
                 }),
                 error_message: Some(e.to_string()),
                 timestamp: Utc::now(),
+                observed_at: Some(Instant::now()),
             }
         }
     }

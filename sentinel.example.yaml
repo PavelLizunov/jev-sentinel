@@ -6,7 +6,7 @@ jev:
   model: "jev-latest"
   base_url: "https://api.typesafe.ai"
   # Egress proxy for restricted/isolated networks (e.g. Russia, corporate VPNs)
-  egress_proxy: "${JEV_EGRESS_PROXY:-http://192.168.0.142:18080}"
+  egress_proxy: "${JEV_EGRESS_PROXY:-http://10.0.0.2:8080}"
   timeout_seconds: 15
 
 # Daemon Loop Settings
@@ -21,63 +21,69 @@ alerting:
     bot_token: "${TELEGRAM_BOT_TOKEN}"
     chat_id: "${TELEGRAM_CHAT_ID}"
     min_severity: "warning" # info, warning, critical
+    # Optional: proxy for Telegram API (falls back to jev.egress_proxy or TELEGRAM_PROXY env var)
+    proxy: "${TELEGRAM_PROXY:-http://10.0.0.2:8080}"
 
 # Bounded Self-Healing Settings
 self_healing:
   enabled: false
   allowed_services:
-    - "osaurus"
+    - "core-service"
     - "caddy"
   require_confirmation: true
+
+# Embedded Web Monitoring Dashboard (Zero Dependencies)
+web:
+  enabled: false
+  listen: "127.0.0.1:8088"
 
 # Monitored Targets
 targets:
   # 1. macOS Host (Apple Silicon memory, swap, LaunchAgents)
   - type: macos_ssh
-    name: "mac-mini-m4"
-    host: "100.116.97.112"
-    user: "slovn"
+    name: "mac-host"
+    host: "10.0.0.50"
+    user: "admin"
     ssh_key: "~/.ssh/id_ed25519"
     timeout_seconds: 5
     check_services:
-      - "osaurus"
-      - "gemma-4-e4b"
+      - "core-service"
 
   # 2. Nvidia GPU Node (Temperature, VRAM, utilization)
   - type: nvidia_ssh
-    name: "gpu-rtx5060ti"
-    host: "x3d-pve-1"
-    user: "root"
+    name: "gpu-node"
+    host: "10.0.0.60"
+    user: "admin"
     ssh_key: "~/.ssh/id_ed25519"
     timeout_seconds: 5
 
   # 3. HTTP Healthchecks
   - type: http_probe
-    name: "hermes-dashboard"
+    name: "app-dashboard"
     url: "http://127.0.0.1:9119"
     expected_status: 200
     timeout_seconds: 3
 
   - type: http_probe
-    name: "ai-gateway"
-    url: "http://192.168.0.220:8317/health"
+    name: "api-service"
+    url: "http://10.0.0.20:8080/health"
     expected_status: 200
     timeout_seconds: 3
 
   # 4. TCP Service Reachability
   - type: tcp_ping
-    name: "caddy-ingress"
-    host: "192.168.0.210"
+    name: "ingress-proxy"
+    host: "10.0.0.15"
     port: 443
     timeout_seconds: 3
 
   # 5. Generic Script / Command Probe (Extensible without Rust recompilation!)
   - type: exec_probe
-    name: "proxmox-quorum"
+    name: "cluster-quorum"
     command:
       - "ssh"
       - "-o"
       - "BatchMode=yes"
-      - "root@192.168.0.169"
+      - "admin@10.0.0.10"
       - "pvecm status | grep -q 'Quorum: Yes' && echo '{\"quorum\": true}'"
     timeout_seconds: 5

@@ -17,6 +17,8 @@ pub struct SentinelConfig {
     pub alerting: AlertingSettings,
     #[serde(default)]
     pub self_healing: SelfHealingSettings,
+    #[serde(default)]
+    pub web: WebSettings,
 }
 
 fn default_version() -> String {
@@ -163,6 +165,8 @@ pub struct TelegramAlertSettings {
     pub chat_id: String,
     #[serde(default = "default_min_severity")]
     pub min_severity: String, // info, warning, critical
+    #[serde(default)]
+    pub proxy: Option<String>,
 }
 
 fn default_min_severity() -> String {
@@ -181,6 +185,27 @@ pub struct SelfHealingSettings {
 
 fn default_true() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_web_listen")]
+    pub listen: String,
+}
+
+impl Default for WebSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: default_web_listen(),
+        }
+    }
+}
+
+fn default_web_listen() -> String {
+    "127.0.0.1:8088".to_string()
 }
 
 // ── Environment Variable Interpolation ──
@@ -202,7 +227,7 @@ pub fn interpolate_env_vars(raw: &str) -> String {
                     } else if nc == ':' && chars.peek() == Some(&'-') {
                         chars.next(); // consume '-'
                         let mut def = String::new();
-                        while let Some(dc) = chars.next() {
+                        for dc in chars.by_ref() {
                             if dc == '}' {
                                 break;
                             }
@@ -228,17 +253,107 @@ pub fn interpolate_env_vars(raw: &str) -> String {
     output
 }
 
+impl std::str::FromStr for SentinelConfig {
+    type Err = SentinelError;
+
+    fn from_str(content: &str) -> Result<Self> {
+        let interpolated = interpolate_env_vars(content);
+        debug!("Parsed interpolated configuration YAML");
+        let config: Self = serde_yaml::from_str(&interpolated)?;
+        if config.daemon.interval_seconds == 0 || config.daemon.concurrency == 0 {
+            return Err(SentinelError::Config(
+                "interval_seconds and concurrency must be positive".into(),
+            ));
+        }
+        if config.targets.len() > 1024 {
+            return Err(SentinelError::Config(
+                "at most 1024 probes are supported".into(),
+            ));
+        }
+        let mut names = std::collections::HashSet::new();
+        for target in &config.targets {
+            if target.name().trim().is_empty()
+                || target.name().len() > 128
+                || !names.insert(target.name())
+            {
+                return Err(SentinelError::Config(
+                    "probe names must be unique, nonempty and at most 128 bytes".into(),
+                ));
+            }
+        }
+        Ok(config)
+    }
+}
+
 impl SentinelConfig {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = std::fs::read_to_string(path.as_ref())
             .map_err(|e| SentinelError::Config(format!("Failed to read config file: {}", e)))?;
-        Self::from_str(&content)
+        content.parse()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_interpolate_env_vars_with_default() {
+        let input = "proxy: \"${NON_EXISTENT_VAR:-http://10.0.0.2:8080}\"";
+        let out = interpolate_env_vars(input);
+        assert_eq!(out, "proxy: \"http://10.0.0.2:8080\"");
     }
 
-    pub fn from_str(content: &str) -> Result<Self> {
-        let interpolated = interpolate_env_vars(content);
-        debug!("Parsed interpolated configuration YAML");
-        let config: Self = serde_yaml::from_str(&interpolated)?;
-        Ok(config)
+    #[test]
+    fn test_interpolate_env_vars_with_actual_env() {
+        std::env::set_var("JEV_TEST_SENTINEL_KEY", "secret-test-key-12345");
+        let input = "api_key: \"${JEV_TEST_SENTINEL_KEY}\"";
+        let out = interpolate_env_vars(input);
+        assert_eq!(out, "api_key: \"secret-test-key-12345\"");
+        std::env::remove_var("JEV_TEST_SENTINEL_KEY");
+    }
+
+    #[test]
+    fn rejects_ambiguous_probe_identity_and_invalid_schedule() {
+        let base = "jev:\n  api_key: test\n";
+        for daemon in ["interval_seconds: 0", "concurrency: 0"] {
+            assert!(format!("{base}daemon:\n  {daemon}\n")
+                .parse::<SentinelConfig>()
+                .is_err());
+        }
+        let probe = "  - type: tcp_ping\n    name: same\n    host: localhost\n    port: 80\n";
+        assert!(format!("{base}targets:\n{probe}{probe}")
+            .parse::<SentinelConfig>()
+            .is_err());
+        assert!(format!("{base}targets:\n{probe}")
+            .parse::<SentinelConfig>()
+            .is_ok());
+        assert!(format!(
+            "{base}targets:\n{}",
+            probe.replace("name: same", "name: ''")
+        )
+        .parse::<SentinelConfig>()
+        .is_err());
+    }
+
+    #[test]
+    fn test_parse_config_with_telegram_proxy() {
+        let yaml = r#"
+jev:
+  api_key: "test-key"
+alerting:
+  telegram:
+    bot_token: "test-token"
+    chat_id: "123456"
+    min_severity: "warning"
+    proxy: "http://10.0.0.2:8080"
+"#;
+        let config: SentinelConfig = yaml.parse().expect("Failed to parse config");
+        assert_eq!(config.jev.api_key, "test-key");
+        let tg = config.alerting.telegram.expect("Telegram config missing");
+        assert_eq!(tg.bot_token, "test-token");
+        assert_eq!(tg.chat_id, "123456");
+        assert_eq!(tg.min_severity, "warning");
+        assert_eq!(tg.proxy.as_deref(), Some("http://10.0.0.2:8080"));
     }
 }

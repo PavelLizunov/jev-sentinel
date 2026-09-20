@@ -23,6 +23,9 @@ pub enum SentinelError {
     #[error("TypeSafe Jev API error: {0}")]
     JevApi(String),
 
+    #[error("Invalid TypeSafe Jev response: {0}")]
+    InvalidJevResponse(String),
+
     #[error("Action execution error: {0}")]
     Action(String),
 }

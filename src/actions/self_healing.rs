@@ -35,7 +35,10 @@ impl SelfHealingManager {
                 info!("Automated cache purge requested by Jev System 1");
             }
             _ => {
-                info!("No automated handler for action '{}'", decision.suggested_action);
+                info!(
+                    "No automated handler for action '{}'",
+                    decision.suggested_action
+                );
             }
         }
 
