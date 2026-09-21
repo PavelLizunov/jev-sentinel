@@ -613,7 +613,12 @@ async fn transport_rate_limit_429_monotonic_embargo_and_fallback() {
             "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 10\r\n\r\nHTML error"
                 .to_string()
         } else {
-            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 35\r\n\r\n{\"parameters\":{\"retry_after\":2}}".to_string()
+            let payload = "{\"parameters\":{\"retry_after\":2}}";
+            format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                payload.len(),
+                payload
+            )
         }
     });
 
@@ -622,12 +627,12 @@ async fn transport_rate_limit_429_monotonic_embargo_and_fallback() {
     let res = n.dispatch_alert_event(&event).await;
     assert!(res.is_err());
 
-    // Verify rate limit embargo is set to >= 1.5s in the future
+    // Verify rate limit embargo is set to 2s in the future (between 1.5s and 2.1s)
     let remaining = n
         .rate_limit_remaining_duration()
         .expect("Embargo deadline must be recorded");
     assert!(
-        remaining >= Duration::from_millis(1500),
+        remaining >= Duration::from_millis(1500) && remaining <= Duration::from_millis(2100),
         "Remaining: {:?}",
         remaining
     );
@@ -638,7 +643,8 @@ async fn transport_rate_limit_429_monotonic_embargo_and_fallback() {
         .rate_limit_remaining_duration()
         .expect("Embargo deadline must still be recorded");
     assert!(
-        remaining_after >= Duration::from_millis(1400),
+        remaining_after >= Duration::from_millis(1400)
+            && remaining_after <= Duration::from_millis(2100),
         "Monotonic max must not shorten embargo"
     );
 }

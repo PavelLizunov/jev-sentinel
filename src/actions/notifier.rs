@@ -105,6 +105,7 @@ pub struct GenerationRecord {
     pub attempts: usize,
     pub exhausted: bool,
     pub exhausted_at: Option<std::time::Instant>,
+    pub last_attempt_at: Option<std::time::Instant>,
     pub delivered_cooldown: Option<(AlertSeverity, std::time::Instant)>,
 }
 
@@ -118,6 +119,7 @@ impl Default for GenerationRecord {
             attempts: 0,
             exhausted: false,
             exhausted_at: None,
+            last_attempt_at: None,
             delivered_cooldown: None,
         }
     }
@@ -144,6 +146,13 @@ impl IncidentState {
             if let Some(ex_at) = r.exhausted_at {
                 if ex_at.elapsed() < Duration::from_secs(600) {
                     return true;
+                }
+            }
+            if r.confirmed_chunks > 0 || r.attempts > 0 {
+                if let Some(att_at) = r.last_attempt_at {
+                    if att_at.elapsed() < Duration::from_secs(600) {
+                        return true;
+                    }
                 }
             }
             false
@@ -522,6 +531,13 @@ impl Notifier {
         };
         if let Ok(mut state) = self.delivery_state.lock() {
             state.in_flight.remove(&inc_id);
+            if let Some(inc) = state.incidents.get_mut(&inc_id.key) {
+                if let Some(rec) = inc.records.get_mut(&inc_id.generation) {
+                    if rec.last_attempt_at.is_none() {
+                        rec.last_attempt_at = Some(std::time::Instant::now());
+                    }
+                }
+            }
             state.prune_incident_records();
         }
     }
@@ -704,6 +720,23 @@ impl Notifier {
         let mut chunks = Vec::new();
         let mut current_chunk = String::new();
         for line in message_text.lines() {
+            if line.chars().count() > 3900 {
+                if !current_chunk.is_empty() {
+                    chunks.push(current_chunk);
+                    current_chunk = String::new();
+                }
+                let line_chars: Vec<char> = line.chars().collect();
+                for chunk_slice in line_chars.chunks(3900) {
+                    let subline: String = chunk_slice.iter().collect();
+                    if subline.chars().count() == 3900 {
+                        chunks.push(subline);
+                    } else {
+                        current_chunk = subline;
+                    }
+                }
+                continue;
+            }
+
             if current_chunk.chars().count() + line.chars().count() + 1 > 3900
                 && !current_chunk.is_empty()
             {
@@ -825,6 +858,7 @@ impl Notifier {
                             attempts: 0,
                             exhausted: false,
                             exhausted_at: None,
+                            last_attempt_at: Some(std::time::Instant::now()),
                             delivered_cooldown: None,
                         });
 
@@ -838,6 +872,7 @@ impl Notifier {
                     rec.attempts = 0;
                     rec.exhausted = false;
                     rec.exhausted_at = None;
+                    rec.last_attempt_at = Some(std::time::Instant::now());
                     (rec.chunks.clone(), 0, 0, false)
                 } else if rec.exhausted || rec.attempts >= 3 {
                     rec.exhausted = true;
@@ -914,6 +949,7 @@ impl Notifier {
                         return Ok(TelegramChunkOutcome::RateLimit(err_text));
                     }
                     if status.as_u16() == 400 {
+                        self.wait_for_rate_limit(shutdown_rx).await?;
                         let fallback_body = json!({
                             "chat_id": tg.chat_id,
                             "text": truncate_field(chunk, 4096),
@@ -958,6 +994,7 @@ impl Notifier {
                         if let Some(inc) = state.incidents.get_mut(&inc_id.key) {
                             let rec = inc.records.entry(inc_id.generation).or_default();
                             rec.confirmed_chunks = confirmed_chunks;
+                            rec.last_attempt_at = Some(std::time::Instant::now());
                         }
                     }
                     TelegramChunkOutcome::RateLimit(err_text) => {
@@ -992,6 +1029,7 @@ impl Notifier {
                 if let Some(inc) = state.incidents.get_mut(&inc_id.key) {
                     let rec = inc.records.entry(inc_id.generation).or_default();
                     rec.attempts = attempt + 1;
+                    rec.last_attempt_at = Some(std::time::Instant::now());
                     if rec.attempts >= 3 {
                         rec.exhausted = true;
                         rec.exhausted_at = Some(std::time::Instant::now());
