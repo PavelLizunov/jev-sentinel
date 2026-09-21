@@ -88,8 +88,11 @@ button, summary, .notice, .advice, footer { overflow-wrap: anywhere; }
 .resources { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; margin: 10px 0; }
 .resources .history-row { margin-top: 0; }
 .grid.compact .resources .spark { display: none; }
+.grid.compact .resources .track { display: none; }
 .grid.compact .resources .history-row { grid-template-columns: minmax(0, 1fr) auto; }
 .grid.compact .target { padding: 10px; }
+.grid.compact .history-row { margin-top: 3px; }
+.grid.compact .spark { height: 18px; }
 .metric-heading { display: flex; justify-content: space-between; gap: 6px; font-size: 11px; }
 .track { height: 4px; background: #344258; margin-top: 4px; }
 .fill { display: block; height: 100%; width: 0; background: #9baec4; }

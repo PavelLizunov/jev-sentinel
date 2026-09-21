@@ -149,7 +149,11 @@ function updateSpark(s, history, key, name) {
   const signature = `${I.locale}:${JSON.stringify([key, points])}`;
   if (signature === s.signature) return; s.signature = signature;
   const valid = points.filter(p => numeric(p.t_ms) && numeric(p[key]));
-  const lo = 0, hi = key === 'ram_pct' ? 100 : Math.max(key === 'latency_ms' ? 100 : 1, ...valid.map(p => p[key]));
+  const maxVal = Math.max(0, ...valid.map(p => p[key]));
+  const lo = 0;
+  const hi = key === 'ram_pct'
+    ? 100
+    : (key === 'latency_ms' ? Math.max(10, Math.ceil(maxVal * 1.2)) : Math.max(1, maxVal));
   const t0 = points[0]?.t_ms || 0, t1 = points.at(-1)?.t_ms || t0;
   let d = '', drawing = false, last = null;
   for (const p of points) {
@@ -177,12 +181,14 @@ function historyRow(metricKey) {
 }
 function meter(metricKey) {
   const root = el('div'), head = el('div', 'metric-heading'), label = el('span', '', metricName(metricKey)), value = el('span', 'number'), track = el('div', 'track'), fill = el('span', 'fill');
-  head.append(label, value); track.append(fill); root.append(head, track); return {root, label, value, fill, metricKey};
+  head.append(label, value); track.append(fill); root.append(head, track); return {root, label, value, fill, track, metricKey};
 }
 function updateMeter(m, value) {
   text(m.value, fmt(value, '%'));
-  m.fill.style.width = numeric(value) ? `${Math.max(0, Math.min(100, value))}%` : '0%';
+  const isNum = numeric(value);
+  m.fill.style.width = isNum ? `${Math.max(0, Math.min(100, value))}%` : '0%';
   m.fill.dataset.level = value >= 90 ? 'critical' : value >= 75 ? 'high' : 'normal';
+  m.track.hidden = !isNum;
 }
 function makeItem(target) {
   const root = el(mode === 'table' ? 'tr' : 'article', mode === 'table' ? '' : 'target');
