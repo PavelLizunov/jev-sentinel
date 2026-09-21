@@ -256,6 +256,31 @@ pub struct Notifier {
     notify: tokio::sync::Notify,
 }
 
+fn next_html_token(s: &str) -> (&str, &str) {
+    if s.starts_with('&') {
+        if let Some(semi_pos) = s.find(';') {
+            if (2..=10).contains(&semi_pos)
+                && s[1..semi_pos].chars().all(|c| c.is_ascii_alphanumeric())
+            {
+                return (&s[..=semi_pos], &s[semi_pos + 1..]);
+            }
+        }
+    } else if s.starts_with('<') {
+        if let Some(tag_end) = s.find('>') {
+            if tag_end <= 25 {
+                return (&s[..=tag_end], &s[tag_end + 1..]);
+            }
+        }
+    }
+    let mut chars = s.chars();
+    if let Some(c) = chars.next() {
+        let len = c.len_utf8();
+        (&s[..len], &s[len..])
+    } else {
+        ("", "")
+    }
+}
+
 impl Notifier {
     pub fn new(telegram: Option<TelegramAlertSettings>) -> Self {
         Self::new_with_fallback(telegram, None)
@@ -719,35 +744,47 @@ impl Notifier {
     fn split_into_chunks(&self, message_text: &str) -> Vec<String> {
         let mut chunks = Vec::new();
         let mut current_chunk = String::new();
+
         for line in message_text.lines() {
-            if line.chars().count() > 3900 {
+            let line_chars_count = line.chars().count();
+            let needed = if current_chunk.is_empty() {
+                line_chars_count
+            } else {
+                current_chunk.chars().count() + 1 + line_chars_count
+            };
+
+            if needed <= 3900 {
                 if !current_chunk.is_empty() {
-                    chunks.push(current_chunk);
-                    current_chunk = String::new();
+                    current_chunk.push('\n');
                 }
-                let line_chars: Vec<char> = line.chars().collect();
-                for chunk_slice in line_chars.chunks(3900) {
-                    let subline: String = chunk_slice.iter().collect();
-                    if subline.chars().count() == 3900 {
-                        chunks.push(subline);
-                    } else {
-                        current_chunk = subline;
-                    }
-                }
+                current_chunk.push_str(line);
                 continue;
             }
 
-            if current_chunk.chars().count() + line.chars().count() + 1 > 3900
-                && !current_chunk.is_empty()
-            {
+            if !current_chunk.is_empty() {
                 chunks.push(current_chunk);
                 current_chunk = String::new();
             }
-            if !current_chunk.is_empty() {
-                current_chunk.push('\n');
+
+            if line_chars_count <= 3900 {
+                current_chunk.push_str(line);
+                continue;
             }
-            current_chunk.push_str(line);
+
+            // Line itself exceeds 3900 characters: split by atomic HTML tokens (entities/tags)
+            let mut rem = line;
+            while !rem.is_empty() {
+                let (tok, rest) = next_html_token(rem);
+                let tok_chars = tok.chars().count();
+                if current_chunk.chars().count() + tok_chars > 3900 && !current_chunk.is_empty() {
+                    chunks.push(current_chunk);
+                    current_chunk = String::new();
+                }
+                current_chunk.push_str(tok);
+                rem = rest;
+            }
         }
+
         if !current_chunk.is_empty() {
             chunks.push(current_chunk);
         }
