@@ -45,6 +45,7 @@ There is no current release-size/RSS benchmark for this dashboard revision. Prov
 ## Documentation
 
 - [Documentation index](docs/README.md)
+- [Cost optimization & LaTeX mathematical models](docs/cost-optimization.md)
 - [Operator guide: search, map, metrics and freshness](docs/operator-guide.md)
 - [Deployment, command side effects and security limits](docs/deployment.md)
 - [Current state and next-chat handoff](docs/handoff-2026-09-20.md)

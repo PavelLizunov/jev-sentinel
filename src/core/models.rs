@@ -36,6 +36,98 @@ pub struct InfrastructureSnapshot {
     pub targets: Vec<TargetTelemetry>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetAnomaly {
+    pub name: String,
+    pub target_type: String,
+    pub status: TargetStatus,
+    pub latency_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetLoadSummary {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ram_used_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap_used_mib: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnomalyDigest {
+    pub timestamp: DateTime<Utc>,
+    pub total_targets: usize,
+    pub online_targets: usize,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub anomalies: Vec<TargetAnomaly>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub elevated_loads: Vec<TargetLoadSummary>,
+}
+
+impl InfrastructureSnapshot {
+    pub fn has_active_anomalies(&self) -> bool {
+        self.targets.iter().any(|t| {
+            if t.status != TargetStatus::Online || t.error_message.is_some() {
+                return true;
+            }
+            let m = crate::core::history::NormalizedMetrics::from_telemetry(t);
+            let high_cpu = m.cpu_pct.is_some_and(|c| c > 80.0);
+            let high_ram = m.ram_used_pct.is_some_and(|r| r > 85.0);
+            high_cpu || high_ram
+        })
+    }
+
+    pub fn build_digest(&self) -> AnomalyDigest {
+        let total = self.targets.len();
+        let mut online = 0;
+        let mut anomalies = Vec::new();
+        let mut elevated_loads = Vec::new();
+
+        for t in &self.targets {
+            if t.status == TargetStatus::Online && t.error_message.is_none() {
+                online += 1;
+            } else {
+                anomalies.push(TargetAnomaly {
+                    name: t.target_name.clone(),
+                    target_type: t.target_type.clone(),
+                    status: t.status.clone(),
+                    latency_ms: (t.latency_ms * 10.0).round() / 10.0,
+                    error_message: t.error_message.clone(),
+                });
+            }
+
+            let m = crate::core::history::NormalizedMetrics::from_telemetry(t);
+            let high_cpu = m.cpu_pct.is_some_and(|c| c > 70.0);
+            let high_ram = m.ram_used_pct.is_some_and(|r| r > 85.0);
+            let high_swap = m.swap_used_mib.is_some_and(|s| s > 500.0);
+
+            if high_cpu || high_ram || high_swap {
+                elevated_loads.push(TargetLoadSummary {
+                    name: t.target_name.clone(),
+                    cpu_pct: m.cpu_pct.map(|c| (c * 10.0).round() / 10.0),
+                    ram_used_pct: m.ram_used_pct.map(|r| (r * 10.0).round() / 10.0),
+                    swap_used_mib: m.swap_used_mib.map(|s| s.round()),
+                });
+            }
+        }
+
+        let summary = format!("{online} of {total} targets online and healthy");
+        AnomalyDigest {
+            timestamp: self.timestamp,
+            total_targets: total,
+            online_targets: online,
+            summary,
+            anomalies,
+            elevated_loads,
+        }
+    }
+}
+
 // ── TypeSafe Jev Request Models ──
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,5 +258,54 @@ mod tests {
         };
         assert!(critical.is_warning());
         assert!(critical.is_critical());
+    }
+
+    #[test]
+    fn test_snapshot_anomaly_detection_and_digest() {
+        let now = Utc::now();
+        let target_healthy = TargetTelemetry {
+            target_name: "healthy-node".to_string(),
+            target_type: "http_probe".to_string(),
+            status: TargetStatus::Online,
+            latency_ms: 2.5,
+            metrics: serde_json::json!({"status_code": 200}),
+            error_message: None,
+            timestamp: now,
+            observed_at: None,
+        };
+
+        let snapshot_healthy = InfrastructureSnapshot {
+            timestamp: now,
+            targets: vec![target_healthy.clone()],
+        };
+
+        assert!(!snapshot_healthy.has_active_anomalies());
+        let digest_healthy = snapshot_healthy.build_digest();
+        assert_eq!(digest_healthy.total_targets, 1);
+        assert_eq!(digest_healthy.online_targets, 1);
+        assert!(digest_healthy.anomalies.is_empty());
+
+        let target_failing = TargetTelemetry {
+            target_name: "failing-node".to_string(),
+            target_type: "http_probe".to_string(),
+            status: TargetStatus::Unreachable,
+            latency_ms: 0.0,
+            metrics: serde_json::json!({"status_code": 500}),
+            error_message: Some("Connection refused".to_string()),
+            timestamp: now,
+            observed_at: None,
+        };
+
+        let snapshot_failing = InfrastructureSnapshot {
+            timestamp: now,
+            targets: vec![target_healthy, target_failing],
+        };
+
+        assert!(snapshot_failing.has_active_anomalies());
+        let digest_failing = snapshot_failing.build_digest();
+        assert_eq!(digest_failing.total_targets, 2);
+        assert_eq!(digest_failing.online_targets, 1);
+        assert_eq!(digest_failing.anomalies.len(), 1);
+        assert_eq!(digest_failing.anomalies[0].name, "failing-node");
     }
 }

@@ -420,6 +420,8 @@ async fn run_daemon(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut cycle_id = 0u64;
+    let mut last_eval_instant: Option<std::time::Instant> = None;
+    let mut is_alert_state = false;
 
     loop {
         tokio::select! {
@@ -453,6 +455,18 @@ async fn run_daemon(
                         next.categories = current.categories.clone();
                         for target in &mut next.targets {
                             target.category = current.targets.iter().find(|t| t.id == target.id).and_then(|t| t.category.clone());
+                        }
+                        if current.phase != "starting" {
+                            next.phase = current.phase.clone();
+                            next.advisor_state = current.advisor_state;
+                            next.system_health = current.system_health.clone();
+                            next.health_confidence = current.health_confidence;
+                            next.risk_score = current.risk_score;
+                            next.action_required = current.action_required;
+                            next.suggested_action = current.suggested_action.clone();
+                            next.jev_latency_ms = current.jev_latency_ms;
+                            next.error_message = current.error_message.clone();
+                            next.error_code = current.error_code.clone();
                         }
                         next.view_revision = current.view_revision.parse::<u64>().unwrap_or(0).saturating_add(1).to_string();
                         *current = Arc::new(next);
@@ -541,95 +555,154 @@ async fn run_daemon(
                     }
                 }
 
-                let t_eval = std::time::Instant::now();
-                match jev_client.evaluate_snapshot(&snapshot).await {
-                    Ok(decision) => {
-                        let eval_latency_ms = t_eval.elapsed().as_secs_f64() * 1000.0;
+                let has_anomalies = snapshot.has_active_anomalies();
+                let should_evaluate = if config.jev.adaptive_digest_enabled {
+                    if has_anomalies {
+                        if !is_alert_state {
+                            info!(
+                                "Fleet anomaly detected! Preempting evaluation timer and escalating to Alert mode ({}s cadence)",
+                                config.jev.eval_cadence_alert_seconds
+                            );
+                            is_alert_state = true;
+                            true
+                        } else {
+                            last_eval_instant.is_none_or(|t| {
+                                t.elapsed() >= Duration::from_secs(config.jev.eval_cadence_alert_seconds)
+                            })
+                        }
+                    } else if is_alert_state {
                         info!(
-                            "Jev verdict (cycle {}): health='{}', risk={:.2}, action='{}'",
-                            cycle_id,
-                            decision.system_health,
-                            decision.risk_score,
-                            decision.suggested_action
+                            "Fleet recovered to normal parameters! Preempting evaluation timer to confirm recovery ({}s cadence)",
+                            config.jev.eval_cadence_normal_seconds
                         );
+                        is_alert_state = false;
+                        true
+                    } else {
+                        last_eval_instant.is_none_or(|t| {
+                            t.elapsed() >= Duration::from_secs(config.jev.eval_cadence_normal_seconds)
+                        })
+                    }
+                } else {
+                    true
+                };
 
-                        if config.web.enabled {
-                            status_tx.send_modify(|current| {
-                                let next = Arc::make_mut(current);
-                                next.set_decision(&decision, eval_latency_ms);
-                                next.view_revision = next.view_revision.parse::<u64>().unwrap_or(0).saturating_add(1).to_string();
-                            });
-                        }
+                if should_evaluate {
+                    last_eval_instant = Some(std::time::Instant::now());
+                    let t_eval = std::time::Instant::now();
+                    let eval_res = if config.jev.adaptive_digest_enabled && !has_anomalies {
+                        let digest = snapshot.build_digest();
+                        jev_client.evaluate_digest(&digest).await
+                    } else {
+                        jev_client.evaluate_snapshot(&snapshot).await
+                    };
 
-                        // Reset advisor unavailable upon successful recovery
-                        notifier.recover_advisor_unavailable();
-                        // Reset risk elevated cooldown ONLY when risk has actually normalized!
-                        if !decision.is_warning() && !decision.is_critical() {
-                            notifier.recover_risk_elevated();
-                        }
-
-                        // Route routine Jev alert through background queue with deduplication
-                        let is_info = config
-                            .alerting
-                            .telegram
-                            .as_ref()
-                            .is_some_and(|tg| tg.min_severity.eq_ignore_ascii_case("info"));
-
-                        if is_info || decision.is_warning() || decision.is_critical() {
-                            let conf_text = match decision.health_confidence {
-                                Some(c) => format!(". Уверенность: {:.0}%", c * 100.0),
-                                None => String::new(),
-                            };
-                            let event = notifier.build_alert_event(
-                                AlertSource::JevAdvisor,
-                                None,
-                                if decision.is_critical() {
-                                    AlertSeverity::Critical
-                                } else if decision.is_warning() {
-                                    AlertSeverity::Warning
+                    match eval_res {
+                        Ok(decision) => {
+                            let eval_latency_ms = t_eval.elapsed().as_secs_f64() * 1000.0;
+                            info!(
+                                "Jev verdict (cycle {}, mode={}): health='{}', risk={:.2}, action='{}'",
+                                cycle_id,
+                                if has_anomalies {
+                                    "alert_snapshot"
                                 } else {
-                                    AlertSeverity::Info
+                                    "normal_digest"
                                 },
-                                AlertReason::RiskElevated,
+                                decision.system_health,
+                                decision.risk_score,
+                                decision.suggested_action
+                            );
+
+                            if config.web.enabled {
+                                status_tx.send_modify(|current| {
+                                    let next = Arc::make_mut(current);
+                                    next.set_decision(&decision, eval_latency_ms);
+                                    next.view_revision = next
+                                        .view_revision
+                                        .parse::<u64>()
+                                        .unwrap_or(0)
+                                        .saturating_add(1)
+                                        .to_string();
+                                });
+                            }
+
+                            // Reset advisor unavailable upon successful recovery
+                            notifier.recover_advisor_unavailable();
+                            // Reset risk elevated cooldown ONLY when risk has actually normalized!
+                            if !decision.is_warning() && !decision.is_critical() {
+                                notifier.recover_risk_elevated();
+                            }
+
+                            // Route routine Jev alert through background queue with deduplication
+                            let is_info = config
+                                .alerting
+                                .telegram
+                                .as_ref()
+                                .is_some_and(|tg| tg.min_severity.eq_ignore_ascii_case("info"));
+
+                            if is_info || decision.is_warning() || decision.is_critical() {
+                                let conf_text = match decision.health_confidence {
+                                    Some(c) => format!(". Уверенность: {:.0}%", c * 100.0),
+                                    None => String::new(),
+                                };
+                                let event = notifier.build_alert_event(
+                                    AlertSource::JevAdvisor,
+                                    None,
+                                    if decision.is_critical() {
+                                        AlertSeverity::Critical
+                                    } else if decision.is_warning() {
+                                        AlertSeverity::Warning
+                                    } else {
+                                        AlertSeverity::Info
+                                    },
+                                    AlertReason::RiskElevated,
+                                    format!(
+                                        "Jev System 1: {}",
+                                        decision.system_health.to_uppercase()
+                                    ),
+                                    format!(
+                                        "Оценка риска: {:.2} / 1.00. Рекомендация: {}{}",
+                                        decision.risk_score, decision.suggested_action, conf_text
+                                    ),
+                                );
+                                notifier.enqueue_alert(event);
+                            }
+
+                            if let Err(e) = self_healing.evaluate_and_heal(&decision).await {
+                                error!("Self-healing error: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to evaluate snapshot via TypeSafe Jev: {}", e);
+                            if config.web.enabled {
+                                status_tx.send_modify(|current| {
+                                    let next = Arc::make_mut(current);
+                                    next.set_error(matches!(
+                                        e,
+                                        jev_sentinel::error::SentinelError::InvalidJevResponse(_)
+                                    ));
+                                    next.view_revision = next
+                                        .view_revision
+                                        .parse::<u64>()
+                                        .unwrap_or(0)
+                                        .saturating_add(1)
+                                        .to_string();
+                                });
+                            }
+
+                            // Informational alert on Jev failure (deduplicated by reason_code: AdvisorUnavailable)
+                            let event = notifier.build_alert_event(
+                                AlertSource::LocalRule,
+                                None,
+                                AlertSeverity::Warning,
+                                AlertReason::AdvisorUnavailable,
+                                "AI Advisor Unavailable".to_string(),
                                 format!(
-                                    "Jev System 1: {}",
-                                    decision.system_health.to_uppercase()
-                                ),
-                                format!(
-                                    "Оценка риска: {:.2} / 1.00. Рекомендация: {}{}",
-                                    decision.risk_score, decision.suggested_action, conf_text
+                                    "AI-рекомендации временно недоступны: {}. Локальный мониторинг активен.",
+                                    e
                                 ),
                             );
                             notifier.enqueue_alert(event);
                         }
-
-                        if let Err(e) = self_healing.evaluate_and_heal(&decision).await {
-                            error!("Self-healing error: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to evaluate snapshot via TypeSafe Jev: {}", e);
-                        if config.web.enabled {
-                            status_tx.send_modify(|current| {
-                                let next = Arc::make_mut(current);
-                                next.set_error(matches!(e, jev_sentinel::error::SentinelError::InvalidJevResponse(_)));
-                                next.view_revision = next.view_revision.parse::<u64>().unwrap_or(0).saturating_add(1).to_string();
-                            });
-                        }
-
-                        // Informational alert on Jev failure (deduplicated by reason_code: AdvisorUnavailable)
-                        let event = notifier.build_alert_event(
-                            AlertSource::LocalRule,
-                            None,
-                            AlertSeverity::Warning,
-                            AlertReason::AdvisorUnavailable,
-                            "AI Advisor Unavailable".to_string(),
-                            format!(
-                                "AI-рекомендации временно недоступны: {}. Локальный мониторинг активен.",
-                                e
-                            ),
-                        );
-                        notifier.enqueue_alert(event);
                     }
                 }
             }

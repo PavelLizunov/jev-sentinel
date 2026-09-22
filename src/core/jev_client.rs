@@ -56,9 +56,23 @@ impl JevClient {
         let state_json = serde_json::to_string(snapshot)?;
         debug!(
             targets = snapshot.targets.len(),
-            "Evaluating telemetry snapshot"
+            "Evaluating full telemetry snapshot"
         );
+        self.evaluate_state(&state_json).await
+    }
 
+    pub async fn evaluate_digest(&self, digest: &AnomalyDigest) -> Result<SentinelDecision> {
+        let state_json = serde_json::to_string(digest)?;
+        debug!(
+            total = digest.total_targets,
+            online = digest.online_targets,
+            anomalies = digest.anomalies.len(),
+            "Evaluating anomaly digest"
+        );
+        self.evaluate_state(&state_json).await
+    }
+
+    pub async fn evaluate_state(&self, state_json: &str) -> Result<SentinelDecision> {
         let mut questions = HashMap::new();
 
         // 1. Overall System Health Choice
@@ -147,12 +161,12 @@ impl JevClient {
 
         let request_payload = SystemOneRequest {
             model: self.model.clone(),
-            state: state_json,
+            state: state_json.to_string(),
             questions,
         };
 
         let url = format!("{}/v1/systemone", self.base_url);
-        info!("Dispatching snapshot evaluation to TypeSafe Jev at {}", url);
+        info!("Dispatching evaluation to TypeSafe Jev at {}", url);
 
         let resp = self
             .client

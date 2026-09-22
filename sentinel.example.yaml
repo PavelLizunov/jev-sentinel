@@ -8,6 +8,10 @@ jev:
   # Egress proxy for restricted/isolated networks (e.g. Russia, corporate VPNs)
   egress_proxy: "${JEV_EGRESS_PROXY:-http://10.0.0.2:8080}"
   timeout_seconds: 15
+  # Cost optimization (Strategy F: adaptive 120s digest in steady state, 30s full snapshot in alert)
+  eval_cadence_normal_seconds: 120
+  eval_cadence_alert_seconds: 30
+  adaptive_digest_enabled: true
 
 # Daemon Loop Settings
 daemon:

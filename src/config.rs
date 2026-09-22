@@ -35,6 +35,12 @@ pub struct JevSettings {
     pub egress_proxy: Option<String>,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
+    #[serde(default = "default_eval_normal_seconds")]
+    pub eval_cadence_normal_seconds: u64,
+    #[serde(default = "default_eval_alert_seconds")]
+    pub eval_cadence_alert_seconds: u64,
+    #[serde(default = "default_true")]
+    pub adaptive_digest_enabled: bool,
 }
 
 fn default_jev_model() -> String {
@@ -47,6 +53,14 @@ fn default_jev_url() -> String {
 
 fn default_timeout_seconds() -> u64 {
     15
+}
+
+fn default_eval_normal_seconds() -> u64 {
+    120
+}
+
+fn default_eval_alert_seconds() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

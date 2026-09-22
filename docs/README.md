@@ -5,6 +5,7 @@ Start with the [project README](../README.md) for installation and the dashboard
 | Document | Use it for |
 |---|---|
 | [Operator guide](operator-guide.md) | Search, filters, map, display modes, resource metrics, freshness and troubleshooting |
+| [Cost optimization](cost-optimization.md) | Mathematical, statistical, and financial models for TypeSafe Jev System 1 inference optimization |
 | [Deployment and limits](deployment.md) | Safe access, configuration, CLI side effects, build/asset updates and production blockers |
 | [Systemd setup](../contrib/systemd/README.md) | Exact system and user service paths and activation commands |
 | [Next-chat handoff](handoff-2026-09-20.md) | Current implementation, real-data preview, evidence and decisions left to the owner |
