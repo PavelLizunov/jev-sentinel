@@ -81,6 +81,7 @@ button, summary, .notice, .advice, footer { overflow-wrap: anywhere; }
 .target-name:hover { background: none; text-decoration: underline; }
 .state { white-space: nowrap; font-size: 12px; }
 .state[data-state="healthy"] { color: var(--ok); }
+.state[data-state="powered_off"], .fleet-cell[data-state="powered_off"] { color: #8da4b8; border-color: #8da4b8; }
 .state[data-state="degraded"] { color: var(--warn); }
 .state[data-state="failed"] { color: var(--bad); }
 .state[data-state="unknown"], .state[data-state="stale"] { color: var(--unknown); }

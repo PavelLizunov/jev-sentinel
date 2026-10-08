@@ -33,6 +33,8 @@
   "summary.failed": "com falha",
   "summary.unknown": "desconhecido",
   "summary.stale": "obsoleto",
+  "summary.powered_off": "Desligado",
+  "state.powered_off": "Desligado",
   "state.healthy": "OK",
   "state.degraded": "Degradado",
   "state.failed": "Com falha",

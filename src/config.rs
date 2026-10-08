@@ -13,12 +13,28 @@ pub struct SentinelConfig {
     pub daemon: DaemonSettings,
     #[serde(default)]
     pub targets: Vec<TargetConfig>,
+    /// Explicit probe-to-Proxmox guest bindings; never inferred from an IP address.
+    #[serde(default)]
+    pub proxmox_guests: Vec<ProxmoxGuestBinding>,
     #[serde(default)]
     pub alerting: AlertingSettings,
     #[serde(default)]
     pub self_healing: SelfHealingSettings,
     #[serde(default)]
     pub web: WebSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxmoxGuestBinding {
+    pub target: String,
+    pub source: String,
+    pub vmid: u64,
+    pub guest_type: String,
+    #[serde(default = "default_guest_age")]
+    pub max_age_seconds: u64,
+}
+fn default_guest_age() -> u64 {
+    90
 }
 
 fn default_version() -> String {
@@ -295,6 +311,21 @@ impl std::str::FromStr for SentinelConfig {
                 ));
             }
         }
+        let mut bound_targets = std::collections::HashSet::new();
+        for binding in &config.proxmox_guests {
+            if !names.contains(binding.target.as_str())
+                || !names.contains(binding.source.as_str())
+                || binding.target == binding.source
+                || !bound_targets.insert(binding.target.as_str())
+                || !matches!(binding.guest_type.as_str(), "qemu" | "lxc")
+                || binding.vmid == 0
+                || !(1..=180).contains(&binding.max_age_seconds)
+            {
+                return Err(SentinelError::Config(
+                    "invalid Proxmox guest binding".into(),
+                ));
+            }
+        }
         Ok(config)
     }
 }
@@ -311,6 +342,17 @@ impl SentinelConfig {
 mod tests {
     use super::*;
 
+    #[test]
+    fn guest_binding_requires_known_unique_targets_and_bounded_age() {
+        let base = "version: '1'\njev: {api_key: test}\ntargets:\n  - {type: exec_probe, name: cluster, command: [echo, '[]']}\n  - {type: tcp_ping, name: worker, host: localhost, port: 22}\n";
+        let valid = "proxmox_guests:\n  - {target: worker, source: cluster, vmid: 101, guest_type: qemu}\n";
+        assert!((base.to_owned() + valid).parse::<SentinelConfig>().is_ok());
+        for bad in [valid.replace("worker", "missing"), valid.replace("qemu", "node"),
+                    valid.replace("101", "0"), valid.replace("guest_type: qemu", "guest_type: qemu, max_age_seconds: 181"),
+                    format!("{valid}  - {{target: worker, source: cluster, vmid: 101, guest_type: qemu}}\n")] {
+            assert!((base.to_owned() + &bad).parse::<SentinelConfig>().is_err());
+        }
+    }
     #[test]
     fn test_interpolate_env_vars_with_default() {
         let input = "proxy: \"${NON_EXISTENT_VAR:-http://10.0.0.2:8080}\"";

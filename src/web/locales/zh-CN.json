@@ -29,6 +29,8 @@
   "summary.failed": "失败",
   "summary.unknown": "未知",
   "summary.stale": "过期",
+  "summary.powered_off": "已关机",
+  "state.powered_off": "已关机",
   "state.healthy": "OK",
   "state.degraded": "降级",
   "state.failed": "失败",

@@ -35,6 +35,8 @@
   "summary.failed": "сбой",
   "summary.unknown": "неизвестно",
   "summary.stale": "устарело",
+  "summary.powered_off": "Выключена",
+  "state.powered_off": "Выключена",
   "state.healthy": "OK",
   "state.degraded": "Деградация",
   "state.failed": "Сбой",

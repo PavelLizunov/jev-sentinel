@@ -7,8 +7,8 @@ const fmt = (n, unit = '', digits = 0) => {
   const key = {'%':'unit.percent', 'ms':'unit.ms', ' MiB':'unit.mib'}[unit];
   return unit ? I.t('value.unit', {value: I.number(n, digits), unit: key ? I.t(key) : unit}) : I.number(n, digits);
 };
-const labels = {healthy: 'OK', degraded: 'Degraded', failed: 'Failed', unknown: 'Unknown', stale: 'Stale'};
-const symbols = {healthy: '·', degraded: '!', failed: '×', unknown: '?', stale: '~'};
+const labels = {powered_off: 'Powered off', healthy: 'OK', degraded: 'Degraded', failed: 'Failed', unknown: 'Unknown', stale: 'Stale'};
+const symbols = {powered_off: '⏻', healthy: '·', degraded: '!', failed: '×', unknown: '?', stale: '~'};
 let data = null, receivedAt = 0, connected = false, timer = null, fetching = false, selectedId = null;
 let mode = 'compact', sortKey = 'name', sortDescending = false;
 try { mode = localStorage.getItem('sentinel.view') || mode; } catch {}
@@ -245,7 +245,7 @@ function reconcile(parent, nodes) {
 }
 function metricForSort(t, key) {
   if (key === 'name') return t.name.toLowerCase();
-  if (key === 'state') return ['failed', 'degraded', 'unknown', 'stale', 'healthy'].indexOf(stateOf(t));
+  if (key === 'state') return ['failed', 'degraded', 'unknown', 'stale', 'powered_off', 'healthy'].indexOf(stateOf(t));
   if (key === 'cpu') return t.normalized?.cpu_pct;
   if (key === 'ram') return t.normalized?.ram_used_pct;
   if (key === 'age') return ageOf(t);
@@ -271,7 +271,7 @@ function render() {
     return;
   }
   const targets = data.targets;
-  const counts = {healthy: 0, degraded: 0, failed: 0, unknown: 0, stale: 0};
+  const counts = {powered_off: 0, healthy: 0, degraded: 0, failed: 0, unknown: 0, stale: 0};
   targets.forEach(t => { const state = stateOf(t); counts[state] = (counts[state] || 0) + 1; });
   text($('total'), I.number(targets.length));
   for (const key of Object.keys(counts)) text($(`count-${key}`), I.number(counts[key]));
@@ -321,7 +321,7 @@ function render() {
   const query = $('search').value.toLowerCase().trim(), category = $('category').value;
   const matches = targets.filter(t => !query ||
     `${t.name} ${t.id} ${t.target_type} ${t.category || ''} ${categoryLabel(t.category)}`.toLowerCase().includes(query));
-  const filtered = matches.filter(t => (!$('issues').checked || stateOf(t) !== 'healthy') && (!category || t.category === category));
+  const filtered = matches.filter(t => (!$('issues').checked || !['healthy', 'powered_off'].includes(stateOf(t))) && (!category || t.category === category));
   const hiddenCount = query ? matches.length - filtered.length : 0;
   $('filterFeedback').hidden = hiddenCount === 0;
   text($('hiddenMatches'), hiddenCount ? I.t('filter.hidden_matches', {count: I.number(hiddenCount)}) : '');

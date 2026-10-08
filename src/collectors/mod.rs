@@ -2,6 +2,7 @@ pub mod exec;
 pub mod http;
 pub mod macos;
 pub mod nvidia;
+pub mod proxmox;
 pub mod runner;
 pub mod tcp;
 

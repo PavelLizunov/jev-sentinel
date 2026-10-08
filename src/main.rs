@@ -150,7 +150,8 @@ async fn run_check(config_path: &PathBuf, alert: bool, force_alert: bool) -> any
 
     println!("\n{}", "1. Collecting Multi-Node Telemetry...".bold());
     let t0 = std::time::Instant::now();
-    let snapshot = collect_all(&config.targets, config.daemon.concurrency).await;
+    let mut snapshot = collect_all(&config.targets, config.daemon.concurrency).await;
+    jev_sentinel::collectors::proxmox::apply_guest_power_state(&mut snapshot, &config.proxmox_guests);
     let elapsed = t0.elapsed();
 
     println!(
@@ -170,6 +171,7 @@ async fn run_check(config_path: &PathBuf, alert: bool, force_alert: bool) -> any
             TargetStatus::Unreachable => "UNREACHABLE".red().bold(),
             TargetStatus::Timeout => "TIMEOUT".yellow().bold(),
             TargetStatus::Unknown => "UNKNOWN".yellow().bold(),
+            TargetStatus::PoweredOff => "POWERED OFF".normal(),
         };
 
         println!(
@@ -445,7 +447,8 @@ async fn run_daemon(
                 cycle_id += 1;
 
                 let t_collect = std::time::Instant::now();
-                let snapshot = collect_all(&config.targets, config.daemon.concurrency).await;
+                let mut snapshot = collect_all(&config.targets, config.daemon.concurrency).await;
+                jev_sentinel::collectors::proxmox::apply_guest_power_state(&mut snapshot, &config.proxmox_guests);
                 let collect_latency_ms = t_collect.elapsed().as_secs_f64() * 1000.0;
 
                 // 1. Immediately publish fresh telemetry to Web Dashboard so notifications cannot delay observations
@@ -475,7 +478,7 @@ async fn run_daemon(
 
                 // 2. Autonomous local alerts queued to background worker based on raw observations
                 for target in &snapshot.targets {
-                    if target.status != TargetStatus::Online {
+                    if !matches!(target.status, TargetStatus::Online | TargetStatus::PoweredOff) {
                         let (sev, reason, title, msg) = match target.status {
                             TargetStatus::Timeout => (
                                 AlertSeverity::Warning,
@@ -538,7 +541,7 @@ async fn run_daemon(
                                         .unwrap_or("некорректный формат ответа")
                                 ),
                             ),
-                            TargetStatus::Online => unreachable!(),
+                            TargetStatus::Online | TargetStatus::PoweredOff => unreachable!(),
                         };
                         let event = notifier.build_alert_event(
                             AlertSource::LocalRule,

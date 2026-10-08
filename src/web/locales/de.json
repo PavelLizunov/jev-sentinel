@@ -31,6 +31,8 @@
   "summary.failed": "fehlgeschlagen",
   "summary.unknown": "unbekannt",
   "summary.stale": "veraltet",
+  "summary.powered_off": "Ausgeschaltet",
+  "state.powered_off": "Ausgeschaltet",
   "state.healthy": "OK",
   "state.degraded": "Beeinträchtigt",
   "state.failed": "Fehlgeschlagen",

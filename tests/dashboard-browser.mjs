@@ -33,7 +33,7 @@ let categories = [
 const observations = Array.from({length:100}, (_,i) => ({
   id: `probe:${i}`, name:i === 1 ? '<img src=x onerror=window.INJECTED=1>' : `node-${String(i).padStart(3,'0')}`,
   target_type:'exec_probe', category:i % 2 ? 'workstations' : 'virtualization',
-  status: i === 0 ? 'timeout' : 'online', state:i === 0 ? 'unknown' : 'healthy',
+  status: i === 0 ? 'timeout' : i === 1 ? 'powered_off' : 'online', state:i === 0 ? 'unknown' : i === 1 ? 'powered_off' : 'healthy',
   measured_at:'2026-09-19T17:00:00Z', age_ms:2000, sample_seq:'20', latency_ms:i === 0 ? null : 12.5,
   normalized:{cpu_pct: i % 100,ram_used_pct:62,available_mib:4000,swap_used_mib:i ? 32 : 0,total_memory_mib:16000,memory_basis:'Synthetic fixture, not a real machine',memory_basis_code:'synthetic'},
   metrics:{status:'running',name:'<script>window.INJECTED=1</script>'},
@@ -147,6 +147,12 @@ try {
     assert.equal(await evaluate('document.getElementById("risk").textContent'),'0.00 / 1.00');
     assert.equal(await evaluate('Boolean(window.INJECTED)'),false);
     assert.equal(await evaluate('document.querySelectorAll("#grid img, #grid script").length'),0);
+  });
+  await check('confirmed power-off has a separate translated count and fleet state',async()=>{
+    assert.equal(await evaluate('document.getElementById("count-powered_off").textContent'),'1');
+    assert.equal(await evaluate('document.getElementById("count-unknown").textContent'),'1');
+    assert.equal(await evaluate('document.querySelectorAll("#fleetMap [data-state=powered_off]").length'),1);
+    assert.equal(await evaluate('stateName("powered_off")'),'Powered off');
   });
   await check('refresh preserves DOM and keyboard focus',async()=>{
     await evaluate('window.originalCard=document.querySelector("#grid article");window.originalButton=originalCard.querySelector("button");originalButton.focus();');
@@ -529,7 +535,7 @@ try {
   await check('initial disconnected state and nested schema errors retranslate without data', async () => {
     failStatus = true;
     await cdp('Page.reload');
-    await waitFor('document.getElementById("connectionError").hidden === false');
+    await waitFor('document.getElementById("connectionError")?.hidden === false');
     for (const loc of ['ru', 'de', 'ja']) {
       await switchLanguage(loc);
       assert.equal(await evaluate('document.getElementById("connection").textContent'), localeCatalogs[loc]['connection.disconnected']);

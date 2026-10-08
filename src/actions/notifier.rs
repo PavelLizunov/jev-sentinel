@@ -1229,6 +1229,7 @@ impl Notifier {
                 TargetStatus::Unreachable => "🔴",
                 TargetStatus::Timeout => "⏱️",
                 TargetStatus::Unknown => "❔",
+                TargetStatus::PoweredOff => "⏻",
             };
             lines.push(format!(
                 "• {} <b>{}</b> ({}): {:.1}ms",

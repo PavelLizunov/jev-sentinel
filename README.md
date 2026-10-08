@@ -136,6 +136,30 @@ export TELEGRAM_CHAT_ID="your-chat-id"
 ```
 The default bind is `127.0.0.1:8088`. A non-loopback bind exposes the existing key/category mutation endpoints, which **do not provide application authentication**. Keep access behind a trusted authenticated gateway or local tunnel; this change does not deploy one.
 
+#### Confirmed Proxmox guest power state
+
+An unavailable guest probe can show `powered_off` (Russian: «Выключена») instead
+of `unknown` when an explicitly bound, fresh, successful Proxmox resource probe
+reports that exact guest as `stopped`. For example:
+
+```yaml
+proxmox_guests:
+  - target: desktop-probe
+    source: cluster-resources
+    vmid: 101
+    guest_type: qemu       # qemu or lxc
+    max_age_seconds: 90    # 1–180 seconds
+```
+
+Both names must refer to configured probes. The source must return the
+`pvesh get /cluster/resources --output-format json` array. Missing, ambiguous,
+stale, failed or future-dated source observations never prove power-off;
+a reachable guest probe is never overridden. Power-off has its own dashboard
+count, produces no fabricated CPU/RAM/latency and is not a local outage alert.
+When the guest is running again, its ordinary probe determines health.
+Aggregate expected-running policies remain separate. Bare hosts without an
+authoritative power-state source retain unknown when unreachable.
+
 #### Dashboard contract (API schema 2)
 
 - `/`, `/dashboard.css`, `/dashboard.js`, `/i18n.js`, and eight whitelisted `/locales/<locale>.json` routes are compiled-in assets (GET/HEAD), not filesystem serving. Unknown locale paths return 404. `/api/status` includes `schema_version: 2`.

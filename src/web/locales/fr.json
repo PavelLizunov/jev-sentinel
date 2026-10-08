@@ -33,6 +33,8 @@
   "summary.failed": "en échec",
   "summary.unknown": "inconnu",
   "summary.stale": "obsolète",
+  "summary.powered_off": "Éteint",
+  "state.powered_off": "Éteint",
   "state.healthy": "OK",
   "state.degraded": "Dégradé",
   "state.failed": "En échec",

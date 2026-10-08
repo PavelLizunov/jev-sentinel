@@ -10,6 +10,7 @@ pub enum TargetStatus {
     Unreachable,
     Timeout,
     Unknown,
+    PoweredOff,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,7 +73,7 @@ pub struct AnomalyDigest {
 impl InfrastructureSnapshot {
     pub fn has_active_anomalies(&self) -> bool {
         self.targets.iter().any(|t| {
-            if t.status != TargetStatus::Online || t.error_message.is_some() {
+            if !matches!(t.status, TargetStatus::Online | TargetStatus::PoweredOff) || t.error_message.is_some() {
                 return true;
             }
             let m = crate::core::history::NormalizedMetrics::from_telemetry(t);

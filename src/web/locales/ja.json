@@ -29,6 +29,8 @@
   "summary.failed": "失敗",
   "summary.unknown": "不明",
   "summary.stale": "期限切れ",
+  "summary.powered_off": "電源オフ",
+  "state.powered_off": "電源オフ",
   "state.healthy": "OK",
   "state.degraded": "低下",
   "state.failed": "失敗",

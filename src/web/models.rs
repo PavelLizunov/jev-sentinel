@@ -65,6 +65,7 @@ pub fn default_categories() -> Vec<CategoryDefinition> {
 #[serde(rename_all = "snake_case")]
 pub enum ObservationState {
     Healthy,
+    PoweredOff,
     Degraded,
     Failed,
     Unknown,
@@ -235,6 +236,7 @@ fn observation(t: &TargetTelemetry) -> ObservationState {
     }
     match t.status {
         TargetStatus::Online => ObservationState::Healthy,
+        TargetStatus::PoweredOff => ObservationState::PoweredOff,
         TargetStatus::Degraded => ObservationState::Degraded,
         TargetStatus::Unreachable
             if t.metrics
@@ -255,6 +257,7 @@ fn observation(t: &TargetTelemetry) -> ObservationState {
 fn public_metrics(m: &serde_json::Value) -> serde_json::Value {
     const KEYS: &[&str] = &[
         "vmid",
+        "power_state_source",
         "type",
         "node",
         "name",
@@ -466,6 +469,21 @@ mod tests {
                 observed_at: Some(at),
             }],
         }
+    }
+    #[test]
+    fn confirmed_powered_off_is_distinct_without_fabricated_metrics_and_expires() {
+        let at = Instant::now();
+        let mut s = snapshot(at, TargetStatus::PoweredOff);
+        s.targets[0].metrics = serde_json::json!({"vmid":101,"type":"qemu","node":"node1","status":"stopped","power_state_source":"cluster"});
+        let mut store = DashboardHistory::new(10);
+        let v = store.observe(1, &s, 1.0);
+        assert_eq!(v.targets[0].state, ObservationState::PoweredOff);
+        assert_eq!(v.targets[0].metrics["status"], "stopped");
+        assert_eq!(v.targets[0].metrics["power_state_source"], "cluster");
+        assert_eq!(v.targets[0].latency_ms, None);
+        assert_eq!(v.targets[0].normalized.cpu_pct, None);
+        assert_eq!(v.online_targets, 0);
+        assert_eq!(v.refreshed_at(at + Duration::from_secs(31)).targets[0].state, ObservationState::Stale);
     }
     #[test]
     fn http_polls_and_advisor_updates_cannot_refresh_observations() {
